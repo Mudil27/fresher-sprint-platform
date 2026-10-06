@@ -85,6 +85,16 @@ docker compose -f docker-compose.event.yml --env-file .env.event --profile tunne
 Stop with `docker compose -f docker-compose.event.yml --env-file .env.event down`
 (add `-v` only if you mean to delete the event database).
 
+## Coolify deployment
+
+`docker-compose.coolify.yml` is the same stack without published ports or the tunnel.
+In Coolify create a Docker Compose resource from this repo (compose file
+`/docker-compose.coolify.yml`), set the `nginx` service domain to
+`https://sprint-quant.tech-iitb.org`, fill `POSTGRES_PASSWORD`, `JWT_SECRET`,
+`ADMIN_PASSWORD` and `ITC_SSO_PROJECT_ID` as environment variables, and deploy. nginx
+reads the client IP from the last `X-Forwarded-For` entry (set by Coolify's proxy), see
+`infra/nginx/coolify/nginx.conf`.
+
 ## Local development (without Docker for the apps)
 
 Requirements: Node 20+, pnpm 11 (`corepack enable`), Docker for Postgres and Redis.
@@ -106,8 +116,8 @@ the Docker proxy, start the databases with
 
 | Route | Who | Purpose |
 |---|---|---|
-| `/` | Everyone | Fresher Sprint homepage and event rules |
-| `/login` | Everyone | Username/password login (development fallback until ITC SSO) |
+| `/` | Signed-in users | Fresher Sprint homepage and event rules |
+| `/login` | Everyone | ITC SSO login (organiser password form folded below) |
 | `/challenges` | Participants | Trading floor: lists the Fresher Warm-up and Fresher Sprint (admins see every challenge) |
 | `/challenges/<id>` | Participants | Trading screen: markets, order book, ticket, portfolio, news, leaderboard |
 | `/admin` | Admin | All challenges and lifecycle controls |
@@ -143,9 +153,7 @@ The bond's total return (default 1.5×) is configurable in the setup form.
 
 ## Trader access
 
-Until ITC SSO is integrated, traders sign in with a username and password at
-`/login`. Self-registration is closed (`/api/auth/register` returns 403); accounts are
-created by the organisers.
+Traders sign in with ITC SSO. Self-registration is closed (`/api/auth/register` returns 403); SSO creates a trader account on first login; organisers create the rest.
 
 For rehearsals, create disposable accounts `lt0001…ltNNNN` that share one password.
 The script refuses to run with `NODE_ENV=production` unless `ALLOW_TEST_USERS=1`, so
@@ -200,19 +208,24 @@ finals-only OTC feature, which Fresher events do not use.
 On Windows without Developer Mode, `next build` cannot create the symlinks for the
 standalone output and fails at the very end; the Docker image builds normally.
 
-## Planned: IITB ITC SSO
+## IITB ITC SSO
 
-Not implemented yet. Login will move to the official IITB ITC SSO (OAuth/OIDC or SAML)
-once ITC provides the protocol, callback URL, credentials, user fields and test access.
+Login uses the ITC SSO (<https://sso.tech-iitb.org/docs/>). Every page except
+`/login` requires a signed-in user.
 
-- Planned callback (OIDC redirect URI or SAML ACS) to register with ITC:
-  `https://<event-domain>/api/auth/itc/callback`
-- Placeholders are in section 4 of `.env.example`; the code does not read them yet.
-- Only minimal identity will be stored. IITB passwords are never handled by this
-  platform, and there will be no custom OTP or email flow.
-- Participants keep a self-chosen display name: 3–20 characters, unique,
-  profanity-filtered, locked when trading starts, renamable by the admin.
-- The username/password login stays as a development and emergency fallback.
+Flow: `/login` button → `GET /api/auth/sso/login` → ITC → `GET /api/auth/callback?accessid=…`
+→ the API exchanges the key for the profile (`POST /project/getuserdata`), creates or
+updates the trader (username = lower-case roll number, display name = ITC name; no
+password is ever stored for it), signs the platform JWT and redirects to
+`/login/complete#token=…`, which stores it and opens the desk.
+
+Setup: register the project at sso.tech-iitb.org with Main url `https://<event-domain>/`
+and Redirect url `https://<event-domain>/api/auth/callback`, then set
+`ITC_SSO_PROJECT_ID` in `.env.event` and recreate the `api` container. Unverified ITC
+projects allow only 10 active logins, so request verification before the event.
+
+Admins sign in through "Organiser sign-in" on `/login` (username/password). An SSO
+login can never take over a non-trader account.
 
 ## Secrets
 

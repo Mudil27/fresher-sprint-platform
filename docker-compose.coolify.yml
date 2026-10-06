@@ -1,13 +1,18 @@
-# Fresher Sprint event stack: the whole platform on one host laptop.
+# Fresher Sprint on Coolify.
 #
-#   cp .env.example .env.event   (then fill in the secrets)
-#   docker compose -f docker-compose.event.yml --env-file .env.event up -d --build
-#   # with the Cloudflare tunnel:
-#   docker compose -f docker-compose.event.yml --env-file .env.event --profile tunnel up -d
+# Coolify: New Resource -> Docker Compose (from this repo) ->
+#   Docker Compose Location: /docker-compose.coolify.yml
+# Then, in the resource:
+#   1. Domains: set the `nginx` service domain to https://sprint-quant.tech-iitb.org
+#      (Coolify routes it to container port 80; enable websockets is automatic).
+#   2. Environment Variables: fill POSTGRES_PASSWORD, JWT_SECRET (>= 32 chars),
+#      ADMIN_PASSWORD (>= 12 chars) and ITC_SSO_PROJECT_ID. Mark them as runtime
+#      variables; NEXT_PUBLIC_* are fixed to "relative" below, so web needs no
+#      build variables.
+#   3. Deploy. `migrate` creates the schema and the admin account, then exits.
 #
-# Entry points (one build serves both — the web app uses relative URLs):
-#   LAN:    http://<host-lan-ip>/            (nginx :80)
-#   Tunnel: https://<your-domain>/           (Cloudflare -> cloudflared -> nginx)
+# No ports are published: Coolify's proxy (Traefik) is the only way in, and nginx
+# serves / (web), /api/ (API) and /ws (gateway) from one origin.
 
 x-node-env: &node-env
   NODE_ENV: production
@@ -22,15 +27,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-qtp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-qtp}
-    # Sized for an ~11 GB Docker VM shared with every other service.
     command:
       - postgres
       - -c
       - max_connections=200
       - -c
-      - shared_buffers=1GB
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
       - -c
-      - effective_cache_size=3GB
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}
       - -c
       - work_mem=8MB
       - -c
@@ -43,7 +47,7 @@ services:
       - shared_preload_libraries=pg_stat_statements
     shm_size: 1gb
     volumes:
-      - qtp-event-pgdata:/var/lib/postgresql/data
+      - qtp-pgdata:/var/lib/postgresql/data
       # Runs only when the data volume is first created.
       - ./infra/postgres/event-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -51,20 +55,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    networks: [internal]
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - qtp-event-redisdata:/data
+      - qtp-redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
-    networks: [internal]
 
   migrate:
     build:
@@ -78,8 +80,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    networks: [internal]
     restart: "no"
+    # One-shot job: it is meant to exit, so Coolify must not treat that as a failure.
+    exclude_from_hc: true
 
   api:
     build:
@@ -88,10 +91,8 @@ services:
       args:
         SERVICE: api
     restart: unless-stopped
-    # Stateless (Redis + Postgres hold all state); nginx spreads requests
-    # across replicas via Docker DNS.
     deploy:
-      replicas: ${API_REPLICAS:-4}
+      replicas: ${API_REPLICAS:-2}
     environment:
       <<: *node-env
       API_PORT: "8000"
@@ -105,7 +106,6 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks: [internal]
 
   gateway:
     build:
@@ -126,7 +126,6 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks: [internal]
 
   engine:
     build:
@@ -146,7 +145,6 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks: [internal]
 
   scoring:
     build:
@@ -163,7 +161,6 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    networks: [internal]
 
   web:
     build:
@@ -179,40 +176,21 @@ services:
       HOSTNAME: 0.0.0.0
     depends_on:
       - api
-    networks: [internal]
 
+  # Public entry. Give THIS service the domain in Coolify (container port 80).
   nginx:
     image: nginx:1.29-alpine
     restart: unless-stopped
-    ports:
-      - "${HTTP_PORT:-80}:80"
+    expose:
+      - "80"
     volumes:
-      - ./infra/nginx/event/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/coolify/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./infra/nginx/event:/etc/nginx/event:ro
     depends_on:
       - web
       - api
       - gateway
-    networks: [internal]
-
-  # Named Cloudflare Tunnel. Create the tunnel in the Cloudflare dashboard,
-  # route its public hostname to http://nginx:8081, and put its token in
-  # CLOUDFLARE_TUNNEL_TOKEN. Started only with `--profile tunnel`.
-  cloudflared:
-    image: cloudflare/cloudflared:2025.9.1
-    profiles: ["tunnel"]
-    restart: unless-stopped
-    command: ["tunnel", "--no-autoupdate", "run"]
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    depends_on:
-      - nginx
-    networks: [internal]
-
-networks:
-  internal:
-    driver: bridge
 
 volumes:
-  qtp-event-pgdata:
-  qtp-event-redisdata:
+  qtp-pgdata:
+  qtp-redisdata:

@@ -1,23 +1,44 @@
 "use client";
 
-import { Suspense, useState } from "react";
-import Link from "next/link";
-import { ArrowLeft, ArrowRight } from "lucide-react";
+import { Suspense, useEffect, useState } from "react";
+import { ArrowRight } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Input, Field } from "@/components/ui/Input";
 import { useAuth } from "@/lib/auth";
 import { ClubBrand } from "@/components/ClubBrand";
 import { ApiError } from "@/lib/api";
+import { NEXT_KEY, safeNextPath } from "@/lib/next-path";
+
+const SSO_ERRORS: Record<string, string> = {
+  sso_expired: "Your ITC session expired. Log in again.",
+  sso_unreachable: "Couldn't reach ITC SSO. Try again in a moment.",
+  sso_disabled: "ITC login is not configured yet. Contact the organisers.",
+};
 
 function LoginInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const { login } = useAuth();
+  const { login, user } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const ssoError = params.get("error");
+
+  // Already signed in: skip the login screen.
+  useEffect(() => {
+    if (user) router.replace(safeNextPath(params.get("next")));
+  }, [user, params, router]);
+
+  function startSso() {
+    try {
+      window.sessionStorage.setItem(NEXT_KEY, safeNextPath(params.get("next")));
+    } catch {
+      // storage blocked: user lands on the desk after sign-in
+    }
+    window.location.assign("/api/auth/sso/login");
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -27,22 +48,7 @@ function LoginInner() {
     try {
       await login(username, password);
 
-      // Normalize before navigating: browsers treat backslashes and // as URL hosts.
-      let next = "/challenges";
-      const requested = params.get("next");
-      if (
-        requested?.startsWith("/") &&
-        !requested.startsWith("//") &&
-        !/[\\\u0000-\u0020]/.test(requested)
-      ) {
-        const destination = new URL(requested, window.location.origin);
-        if (
-          destination.origin === window.location.origin &&
-          !destination.pathname.startsWith("//")
-        ) {
-          next = `${destination.pathname}${destination.search}${destination.hash}`;
-        }
-      }
+      const next = safeNextPath(params.get("next"));
       router.push(next);
     } catch (err) {
       if (err instanceof ApiError) {
@@ -66,13 +72,6 @@ function LoginInner() {
     <div className="min-h-dvh bg-bg">
       <header className="flex min-h-20 items-center justify-between gap-4 border-b border-border px-5 sm:px-10">
         <ClubBrand />
-        <Link
-          href="/"
-          className="flex min-h-11 items-center gap-2 text-xs text-muted transition-colors hover:text-text focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
-        >
-          <ArrowLeft aria-hidden="true" className="size-3.5" />
-          Event home
-        </Link>
       </header>
       <main
         id="main"
@@ -159,14 +158,37 @@ function LoginInner() {
               Log in to the desk.
             </h1>
             <p className="mt-3 text-sm leading-relaxed text-muted">
-              Use the username and password for your participant account.
+              Sign in with your IITB ITC account. You need to be logged in to
+              see anything on this site.
             </p>
+            {ssoError && (
+              <div
+                role="alert"
+                className="mt-6 rounded-sm border border-down bg-surface px-3 py-3 text-sm leading-relaxed text-down"
+              >
+                {SSO_ERRORS[ssoError] ??
+                  "ITC sign-in failed. Try again, or ask an organiser."}
+              </div>
+            )}
+            <Button
+              type="button"
+              size="lg"
+              className="mt-8 w-full justify-between"
+              onClick={startSso}
+            >
+              Log in with ITC SSO
+              <ArrowRight aria-hidden="true" className="size-4" />
+            </Button>
 
+            <details className="mt-10 border-t border-border pt-5">
+              <summary className="mono cursor-pointer text-[10px] uppercase tracking-wider text-muted">
+                Organiser sign-in
+              </summary>
             <form
               onSubmit={submit}
               aria-busy={loading}
               aria-describedby={error ? "auth-error" : undefined}
-              className="mt-8"
+              className="mt-5"
             >
               <fieldset disabled={loading} className="min-w-0 space-y-5">
                 <legend className="sr-only">Sign in details</legend>
@@ -218,7 +240,7 @@ function LoginInner() {
                 {loading ? "Submitting your details. Please wait." : ""}
               </span>
             </form>
-
+            </details>
           </div>
         </section>
       </main>
