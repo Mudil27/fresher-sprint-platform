@@ -84,15 +84,13 @@ services:
     # One-shot job: it is meant to exit, so Coolify must not treat that as a failure.
     exclude_from_hc: true
 
-  api:
+  api: &api
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.service
       args:
         SERVICE: api
     restart: unless-stopped
-    deploy:
-      replicas: ${API_REPLICAS:-2}
     environment:
       <<: *node-env
       API_PORT: "8000"
@@ -107,7 +105,7 @@ services:
       redis:
         condition: service_healthy
 
-  gateway:
+  gateway: &gateway
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.service
@@ -115,8 +113,6 @@ services:
         SERVICE: gateway
     restart: unless-stopped
     command: ["node", "dist/index.js"]
-    deploy:
-      replicas: ${GATEWAY_REPLICAS:-2}
     environment:
       <<: *node-env
       GATEWAY_PORT: "8080"
@@ -126,6 +122,13 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+
+  # Second instances: Coolify sets container_name on every service, which rules
+  # out deploy.replicas, so scaling is done with explicit copies. Add api3 etc.
+  # the same way and list them in infra/nginx/coolify/nginx.conf.
+  api2: *api
+
+  gateway2: *gateway
 
   engine:
     build:
@@ -189,7 +192,9 @@ services:
     depends_on:
       - web
       - api
+      - api2
       - gateway
+      - gateway2
 
 volumes:
   qtp-pgdata:
