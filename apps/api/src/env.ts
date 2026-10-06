@@ -10,8 +10,10 @@ export const env = {
   databaseUrl:
     process.env.DATABASE_URL ?? "postgresql://qtp:qtp@localhost:5432/qtp",
   redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
-  /** IITB ITC SSO; enabled whenever a project id is configured. */
-  ssoProjectId: process.env.ITC_SSO_PROJECT_ID?.trim() ?? "",
+  /** IITB ITC SSO project id (public, not a secret); env var overrides. */
+  ssoProjectId:
+    process.env.ITC_SSO_PROJECT_ID?.trim() ||
+    "0c54a7ef-bf24-44bd-b997-a84ef4499c84",
   ssoBaseUrl: (
     process.env.ITC_SSO_BASE_URL ?? "https://sso.tech-iitb.org"
   ).replace(/\/+$/, ""),
