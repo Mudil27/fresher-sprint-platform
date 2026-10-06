@@ -1,0 +1,3 @@
+# Postgres for Coolify with the diagnostics init script baked in (no bind mounts).
+FROM postgres:17-alpine
+COPY infra/postgres/event-init/ /docker-entrypoint-initdb.d/

@@ -21,7 +21,9 @@ x-node-env: &node-env
 
 services:
   postgres:
-    image: postgres:17-alpine
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.postgres-coolify
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-qtp}
@@ -48,8 +50,6 @@ services:
     shm_size: 1gb
     volumes:
       - qtp-pgdata:/var/lib/postgresql/data
-      # Runs only when the data volume is first created.
-      - ./infra/postgres/event-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qtp}"]
       interval: 5s
@@ -182,13 +182,12 @@ services:
 
   # Public entry. Give THIS service the domain in Coolify (container port 80).
   nginx:
-    image: nginx:1.29-alpine
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.nginx-coolify
     restart: unless-stopped
     expose:
       - "80"
-    volumes:
-      - ./infra/nginx/coolify/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./infra/nginx/event:/etc/nginx/event:ro
     depends_on:
       - web
       - api

@@ -1,0 +1,5 @@
+# nginx for Coolify. Config is baked in because Coolify cannot bind-mount files
+# from the cloned repo (they would be created as empty directories).
+FROM nginx:1.29-alpine
+COPY infra/nginx/coolify/nginx.conf /etc/nginx/nginx.conf
+COPY infra/nginx/event/locations.conf /etc/nginx/event/locations.conf
