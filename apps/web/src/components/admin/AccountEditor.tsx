@@ -1,0 +1,710 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Download, RefreshCw, Upload } from "lucide-react";
+import {
+  formatInstrumentLabel,
+  type AdminAccountView,
+  type Challenge,
+} from "@qtp/shared";
+import { Panel, PanelHeader } from "@/components/ui/Panel";
+import { Button } from "@/components/ui/Button";
+import { Input, Select, Field } from "@/components/ui/Input";
+import { ApiError, get, post } from "@/lib/api";
+import { API_URL, TOKEN_KEY } from "@/lib/config";
+import { cn } from "@/lib/cn";
+import { money, signed } from "@/lib/format";
+
+type EditMode = "set" | "adjust";
+
+const MODES: Array<{ id: EditMode; label: string }> = [
+  { id: "set", label: "Set value" },
+  { id: "adjust", label: "Adjust by" },
+];
+
+function editError(err: unknown): string {
+  const body =
+    err instanceof ApiError
+      ? (err.body as { error?: string; symbol?: string } | null)
+      : null;
+  switch (body?.error) {
+    case "challenge_not_live":
+      return "Accounts can only be edited while the challenge is live.";
+    case "not_enrolled":
+      return "That trader is no longer enrolled in this challenge.";
+    case "unknown_symbol":
+      return `${body.symbol ?? "That symbol"} is not listed in this challenge.`;
+    case "validation_error":
+      return "Check the values: cash must be a number and quantities whole numbers.";
+    case "invalid_backup":
+      return "That file is not a challenge backup CSV.";
+    case "wrong_challenge":
+      return "That CSV was exported from a different challenge.";
+    case "empty_backup":
+      return "That CSV has no trader rows to restore.";
+    case "no_matching_traders":
+      return "None of the traders in that CSV are enrolled in this challenge.";
+    default:
+      return "Could not update the account. Try again.";
+  }
+}
+
+/**
+ * Host override for a trader's cash and inventory, applied by the engine.
+ * "Set value" edits are absolute, so fills between loading and applying are
+ * replaced for the fields that changed; "Adjust by" edits are deltas added to
+ * the live balances, so those fills are kept.
+ */
+export function AccountEditor({
+  challenge,
+  onChange,
+}: {
+  challenge: Challenge;
+  onChange?: () => void;
+}) {
+  const challengeId = challenge.id;
+  const [accounts, setAccounts] = useState<AdminAccountView[]>([]);
+  const [userId, setUserId] = useState("");
+  const [mode, setMode] = useState<EditMode>("set");
+  const [cash, setCash] = useState("");
+  const [cashAll, setCashAll] = useState("");
+  const [quantities, setQuantities] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [cashAllBusy, setCashAllBusy] = useState(false);
+  const [enrolling, setEnrolling] = useState<"one" | "all" | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await get<{ accounts: AdminAccountView[] }>(
+        `/api/admin/${challengeId}/accounts`,
+      );
+      setAccounts(res.accounts);
+      setUserId((cur) =>
+        res.accounts.some((a) => a.userId === cur)
+          ? cur
+          : (res.accounts[0]?.userId ?? ""),
+      );
+      setError(null);
+    } catch {
+      setError("Could not load trader accounts. Reload to try again.");
+    } finally {
+      setLoading(false);
+    }
+  }, [challengeId]);
+
+  const live = challenge.status === "live";
+  const joinable =
+    challenge.status !== "ended" &&
+    !(challenge.endsAt && Date.parse(challenge.endsAt) <= Date.now());
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const account = accounts.find((a) => a.userId === userId);
+  const waiting = accounts.filter((a) => !a.enrolled);
+  const seated = accounts.filter((a) => a.enrolled);
+
+  const symbols = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...challenge.config.symbols.map((s) => s.symbol),
+          ...(challenge.config.eden?.etfs ?? []).map((e) => e.symbol),
+          ...(account?.positions ?? []).map((p) => p.symbol),
+        ]),
+      ),
+    [challenge.config, account],
+  );
+
+  const adjust = mode === "adjust";
+
+  // Reset the form whenever the trader, data or mode changes: stored values
+  // to set from, or blank deltas to adjust by.
+  useEffect(() => {
+    if (!account) return;
+    if (adjust) {
+      setCash("");
+      setQuantities({});
+      return;
+    }
+    setCash(account.cash.toFixed(2));
+    setQuantities(
+      Object.fromEntries(
+        account.positions.map((p) => [p.symbol, String(p.quantity)]),
+      ),
+    );
+  }, [account, adjust]);
+
+  const held = (symbol: string) =>
+    account?.positions.find((p) => p.symbol === symbol);
+
+  const cashInput = cash.trim() === "" ? undefined : Number(cash);
+  const cashChange =
+    !account || cashInput === undefined
+      ? undefined
+      : adjust
+        ? cashInput !== 0
+          ? { next: account.cash + cashInput, delta: cashInput }
+          : undefined
+        : cashInput !== Number(account.cash.toFixed(2))
+          ? { next: cashInput, delta: cashInput - account.cash }
+          : undefined;
+  const positionChanges = symbols.flatMap((symbol) => {
+    const raw = quantities[symbol]?.trim() ?? "";
+    const current = held(symbol)?.quantity ?? 0;
+    const value = raw === "" ? 0 : Number(raw);
+    const next = adjust ? current + value : value;
+    return next !== current
+      ? [{ symbol, current, next, delta: next - current }]
+      : [];
+  });
+  const invalid =
+    (cashChange !== undefined && !Number.isFinite(cashChange.next)) ||
+    positionChanges.some((p) => !Number.isSafeInteger(p.next));
+  const hasChanges = cashChange !== undefined || positionChanges.length > 0;
+
+  function switchMode(next: EditMode) {
+    setMode(next);
+    setMsg(null);
+    setError(null);
+  }
+
+  async function apply() {
+    if (!account || !hasChanges || invalid) return;
+    setBusy(true);
+    setError(null);
+    setMsg(null);
+    try {
+      await post(
+        `/api/admin/${challengeId}/accounts/${account.userId}`,
+        adjust
+          ? {
+              ...(cashChange ? { cashDelta: cashChange.delta } : {}),
+              ...(positionChanges.length
+                ? {
+                    positions: positionChanges.map(({ symbol, delta }) => ({
+                      symbol,
+                      delta,
+                    })),
+                  }
+                : {}),
+            }
+          : {
+              ...(cashChange ? { cash: cashChange.next } : {}),
+              ...(positionChanges.length
+                ? {
+                    positions: positionChanges.map(({ symbol, next }) => ({
+                      symbol,
+                      quantity: next,
+                    })),
+                  }
+                : {}),
+            },
+      );
+      setMsg(
+        `Edit sent for ${account.displayName || account.username}. They are notified when the engine applies it.`,
+      );
+      // Deltas are not idempotent: clear them so a second click cannot resend.
+      if (adjust) {
+        setCash("");
+        setQuantities({});
+      }
+      setTimeout(load, 800);
+    } catch (err) {
+      setError(editError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyCashAll() {
+    const next = Number(cashAll);
+    if (!Number.isFinite(next) || cashAllBusy || seated.length === 0) return;
+    setCashAllBusy(true);
+    setError(null);
+    setMsg(null);
+    try {
+      const res = await post<{ count?: number }>(
+        `/api/admin/${challengeId}/accounts/cash-all`,
+        { cash: next },
+      );
+      setMsg(
+        `Set cash to ${money(next)} for ${res.count ?? seated.length} traders.`,
+      );
+      setTimeout(load, 800);
+    } catch (err) {
+      setError(editError(err));
+    } finally {
+      setCashAllBusy(false);
+    }
+  }
+
+  async function enroll(all: boolean) {
+    if (!joinable || enrolling) return;
+    const ids = all
+      ? waiting.map((a) => a.userId)
+      : account && !account.enrolled
+        ? [account.userId]
+        : [];
+    if (ids.length === 0) return;
+    setEnrolling(all ? "all" : "one");
+    setError(null);
+    setMsg(null);
+    try {
+      const res = await post<{ enrolled: number }>(
+        `/api/admin/${challengeId}/enroll`,
+        all ? { allTraders: true } : { userIds: ids },
+      );
+      setMsg(
+        res.enrolled === 0
+          ? "Those traders were already enrolled."
+          : res.enrolled === 1
+            ? "Enrolled 1 trader with starting cash."
+            : `Enrolled ${res.enrolled} traders with starting cash.`,
+      );
+      await load();
+      onChange?.();
+    } catch (err) {
+      const code =
+        err instanceof ApiError
+          ? (err.body as { error?: string } | null)?.error
+          : null;
+      setError(
+        code === "challenge_not_joinable"
+          ? "This challenge has ended; traders can no longer be enrolled."
+          : "Could not enroll traders. Try again.",
+      );
+    } finally {
+      setEnrolling(null);
+    }
+  }
+
+  async function exportBackup() {
+    if (exporting) return;
+    setExporting(true);
+    setError(null);
+    setMsg(null);
+    try {
+      const token =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(TOKEN_KEY)
+          : null;
+      const res = await fetch(
+        `${API_URL}/api/admin/${challengeId}/backup.csv`,
+        {
+          headers: token ? { authorization: `Bearer ${token}` } : {},
+        },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new ApiError(res.status, body);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const match = /filename="([^"]+)"/.exec(
+        res.headers.get("content-disposition") ?? "",
+      );
+      link.href = url;
+      link.download = match?.[1] ?? `quantstorm-${challengeId}-backup.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setMsg(
+        "Backup downloaded. Freeze the market before exporting if you need the file to match live engine state.",
+      );
+    } catch (err) {
+      setError(editError(err));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function pickImport() {
+    if (!live || importing) return;
+    fileRef.current?.click();
+  }
+
+  async function importBackup(file: File | undefined) {
+    if (!file || !live || importing) return;
+    if (
+      !window.confirm(
+        "This replaces cash, inventory, loan debt, and bonds for every trader in the file, and cancels their working orders. Continue?",
+      )
+    ) {
+      return;
+    }
+    setImporting(true);
+    setError(null);
+    setMsg(null);
+    try {
+      const csv = await file.text();
+      const res = await post<{ count?: number; skipped?: string[] }>(
+        `/api/admin/${challengeId}/backup/import`,
+        { csv },
+      );
+      const skipped = res.skipped?.length
+        ? ` Skipped ${res.skipped.length}: ${res.skipped.slice(0, 8).join(", ")}${res.skipped.length > 8 ? "…" : ""}.`
+        : "";
+      setMsg(
+        `Restore sent for ${res.count ?? 0} trader${res.count === 1 ? "" : "s"}.${skipped} They are notified when the engine applies it.`,
+      );
+      setTimeout(load, 800);
+    } catch (err) {
+      setError(editError(err));
+    } finally {
+      setImporting(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  return (
+    <Panel className="min-w-0 rounded-md backdrop-blur-none">
+      <PanelHeader title="Trader accounts">
+        <span className="text-[11px] text-muted">
+          <span className="mono text-text">{seated.length}</span> enrolled
+          {waiting.length > 0 && (
+            <>
+              {" · "}
+              <span className="mono text-text">{waiting.length}</span> not in
+              this event
+            </>
+          )}
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={load}
+          loading={loading}
+          aria-label="Reload trader accounts"
+        >
+          {!loading && <RefreshCw className="size-3.5" />}
+          Reload
+        </Button>
+      </PanelHeader>
+      <div className="space-y-4 p-4">
+        {live ? (
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <p className="min-w-0 max-w-prose flex-1 text-xs leading-relaxed text-muted">
+              {adjust
+                ? "Add to or subtract from a trader's cash and inventory. Changes apply to their live balances, so anything filled since this view loaded is kept."
+                : "Set a trader's cash and inventory directly. Values are absolute and replace anything filled since this view loaded."}{" "}
+              Margin rules apply to the result, and the trader is notified.
+            </p>
+            <div
+              role="group"
+              aria-label="Edit mode"
+              className="flex shrink-0 rounded-md border border-border bg-surface-2 p-0.5"
+            >
+              {MODES.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => switchMode(m.id)}
+                  aria-pressed={mode === m.id}
+                  className={cn(
+                    "rounded px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-accent",
+                    mode === m.id
+                      ? "bg-accent-subtle text-text"
+                      : "text-muted hover:text-text",
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p className="text-xs leading-relaxed text-muted">
+            Registered traders appear here even before they join. Enroll them to
+            give starting cash and include them on the Deal Desk and leaderboard.
+          </p>
+        )}
+        <div className="flex flex-wrap items-end justify-between gap-3 rounded-md border border-border bg-surface-2 px-3 py-2">
+          <div className="min-w-0 max-w-prose">
+            <p className="text-xs font-medium text-text">Backup</p>
+            <p className="text-[11px] leading-relaxed text-muted">
+              Download every enrolled trader's cash, inventory, loan debt, and
+              bonds as CSV. Freeze first so the file matches the live engine.
+              Import replaces those balances and cancels their working orders.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              aria-hidden
+              onChange={(e) => void importBackup(e.target.files?.[0])}
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void exportBackup()}
+              loading={exporting}
+            >
+              {!exporting && <Download className="size-3.5" />}
+              Export CSV
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={pickImport}
+              loading={importing}
+              disabled={!live}
+            >
+              {!importing && <Upload className="size-3.5" />}
+              Import CSV
+            </Button>
+          </div>
+        </div>
+        <div
+          className={cn(
+            "grid gap-3",
+            live && "sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]",
+          )}
+        >
+          <Field label="Trader">
+            <Select
+              value={userId}
+              onChange={(e) => {
+                setUserId(e.target.value);
+                setMsg(null);
+                setError(null);
+              }}
+              disabled={accounts.length === 0}
+            >
+              {accounts.length === 0 && (
+                <option value="">
+                  {loading ? "Loading…" : "No registered traders"}
+                </option>
+              )}
+              {accounts.map((a) => (
+                <option key={a.userId} value={a.userId}>
+                  {a.displayName || a.username}
+                  {a.displayName && a.displayName !== a.username
+                    ? ` (${a.username})`
+                    : ""}
+                  {a.enrolled ? "" : " — not enrolled"}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          {live && (
+            <Field
+              label={adjust ? "Cash change" : "Cash balance"}
+              hint={
+                account?.enrolled
+                  ? `Stored ${money(account.cash)}${account.loanDebt > 0 ? ` · loan debt ${money(account.loanDebt)}` : ""}`
+                  : account
+                    ? "Enroll this trader before editing cash."
+                    : undefined
+              }
+            >
+              <Input
+                type="number"
+                step="0.01"
+                value={cash}
+                placeholder={adjust ? "0.00" : undefined}
+                onChange={(e) => setCash(e.target.value)}
+                disabled={!account?.enrolled}
+                className="mono"
+              />
+            </Field>
+          )}
+        </div>
+
+        {live && seated.length > 0 && (
+          <div className="flex flex-wrap items-end gap-3 rounded-md border border-border bg-surface-2 px-3 py-2">
+            <Field
+              label="Set cash for all"
+              hint={`Applies the same cash balance to ${seated.length} enrolled trader${seated.length === 1 ? "" : "s"}.`}
+            >
+              <Input
+                type="number"
+                step="0.01"
+                value={cashAll}
+                onChange={(e) => setCashAll(e.target.value)}
+                className="mono"
+              />
+            </Field>
+            <Button
+              size="sm"
+              onClick={applyCashAll}
+              loading={cashAllBusy}
+              disabled={!cashAll.trim() || !Number.isFinite(Number(cashAll))}
+            >
+              Set cash for all
+            </Button>
+          </div>
+        )}
+
+        {waiting.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-surface-2 px-3 py-2">
+            <p className="min-w-0 text-xs text-muted">
+              {!joinable
+                ? `${waiting.length} registered trader${waiting.length === 1 ? "" : "s"} never joined this event.`
+                : account && !account.enrolled
+                  ? `${account.displayName || account.username} has an account but is not in this event. Enroll them to assign starting cash and show them on the Deal Desk.`
+                  : `${waiting.length} registered trader${waiting.length === 1 ? "" : "s"} ${waiting.length === 1 ? "is" : "are"} not enrolled yet.`}
+            </p>
+            {joinable && (
+              <div className="flex flex-wrap gap-2">
+                {account && !account.enrolled && (
+                  <Button
+                    size="sm"
+                    onClick={() => enroll(false)}
+                    loading={enrolling === "one"}
+                    disabled={enrolling !== null}
+                  >
+                    Enroll trader
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant={
+                    account && !account.enrolled ? "secondary" : "primary"
+                  }
+                  onClick={() => enroll(true)}
+                  loading={enrolling === "all"}
+                  disabled={enrolling !== null}
+                >
+                  Enroll all ({waiting.length})
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {live && account?.enrolled && (
+          <div
+            className="overflow-x-auto"
+            tabIndex={0}
+            role="region"
+            aria-label="Inventory"
+          >
+            <table className="w-full min-w-[360px] text-xs">
+              <thead>
+                <tr className="border-b border-border text-left text-[11px] text-muted">
+                  <th className="py-1.5 pr-3 font-medium">Symbol</th>
+                  <th className="py-1.5 pr-3 text-right font-medium">Held</th>
+                  <th className="py-1.5 pr-3 text-right font-medium">
+                    Avg price
+                  </th>
+                  <th className="w-32 py-1.5 font-medium">
+                    {adjust ? "Change" : "New quantity"}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {symbols.map((symbol) => {
+                  const pos = held(symbol);
+                  return (
+                    <tr
+                      key={symbol}
+                      className="border-b border-border last:border-0"
+                    >
+                      <td className="py-1.5 pr-3 font-medium">
+                        {formatInstrumentLabel(symbol)}
+                      </td>
+                      <td className="mono py-1.5 pr-3 text-right tabular-nums">
+                        {pos?.quantity ?? 0}
+                      </td>
+                      <td className="mono py-1.5 pr-3 text-right tabular-nums text-muted">
+                        {pos ? money(pos.avgPrice) : "—"}
+                      </td>
+                      <td className="py-1">
+                        <Input
+                          aria-label={`${symbol} ${adjust ? "quantity change" : "new quantity"}`}
+                          type="number"
+                          step="1"
+                          value={quantities[symbol] ?? ""}
+                          placeholder="0"
+                          onChange={(e) =>
+                            setQuantities((q) => ({
+                              ...q,
+                              [symbol]: e.target.value,
+                            }))
+                          }
+                          className="mono h-8"
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <p className="mt-1.5 text-[11px] text-faint">
+              {adjust
+                ? "Negative changes reduce inventory and can take it short. Blank means no change."
+                : "Negative quantities are short positions."}{" "}
+              New or flipped positions are costed at the current mark.
+            </p>
+          </div>
+        )}
+
+        {live && account?.enrolled && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
+          <p className="min-w-0 text-xs text-muted">
+            {hasChanges ? (
+              <>
+                Changes:{" "}
+                <span className="mono text-text">
+                  {[
+                    ...(cashChange !== undefined && account
+                      ? [
+                          Number.isFinite(cashChange.next)
+                            ? `cash ${money(account.cash)} → ${money(cashChange.next)}${adjust ? ` (${signed(cashChange.delta)})` : ""}`
+                            : `cash ${money(account.cash)} → ?`,
+                        ]
+                      : []),
+                    ...positionChanges.map(
+                      (p) =>
+                        `${p.symbol} ${p.current} → ${p.next}${adjust ? ` (${signed(p.delta, 0)})` : ""}`,
+                    ),
+                  ].join(" · ")}
+                </span>
+              </>
+            ) : (
+              "No changes."
+            )}
+          </p>
+          <Button
+            onClick={apply}
+            loading={busy}
+            disabled={!account?.enrolled || !live || !hasChanges || invalid}
+          >
+            Apply changes
+          </Button>
+        </div>
+        )}
+        {invalid && live && account?.enrolled && (
+          <p role="alert" className="text-xs text-down">
+            {adjust
+              ? "Quantity changes must be whole numbers."
+              : "Quantities must be whole numbers."}
+          </p>
+        )}
+        {msg && (
+          <p role="status" className="text-xs text-up">
+            {msg}
+          </p>
+        )}
+        {error && (
+          <p role="alert" className="text-xs text-down">
+            {error}
+          </p>
+        )}
+      </div>
+    </Panel>
+  );
+}

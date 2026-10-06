@@ -1,0 +1,9 @@
+# Optional, Linux only: host networking for Postgres and Redis, for kernels where
+# the Docker userland proxy resets Postgres connections. Do not use on Docker
+# Desktop (Windows/macOS). Use it explicitly:
+#   docker compose -f docker-compose.yml -f docker-compose.linux-hostnet.yml up -d
+services:
+  postgres:
+    network_mode: host
+  redis:
+    network_mode: host

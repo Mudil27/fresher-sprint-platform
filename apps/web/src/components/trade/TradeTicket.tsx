@@ -1,0 +1,491 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  DEFAULT_ORDER_QTY_PRESETS,
+  formatInstrumentLabel,
+  type Order,
+  type OrderSide,
+  type OrderType,
+} from "@qtp/shared";
+import { Panel, PanelHeader } from "@/components/ui/Panel";
+import { Button } from "@/components/ui/Button";
+import { Input, Select, Field } from "@/components/ui/Input";
+import { ApiError, get, post } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import { cn } from "@/lib/cn";
+import { orderRejectText } from "@/lib/fresher";
+import type { OrderEvent } from "@/hooks/useRealtime";
+
+type TicketKind = "limit" | "market" | "ioc";
+
+export function TradeTicket({
+  challengeId,
+  symbol,
+  maxQuantity,
+  minPosition = -maxQuantity,
+  maxPosition = maxQuantity,
+  maxOpenOrders = 25,
+  refreshKey = 0,
+  price,
+  onPriceChange,
+  frozen = false,
+  buysBlocked = false,
+  positionQty = 0,
+  qtyPresets = DEFAULT_ORDER_QTY_PRESETS,
+  lockedMessage,
+  orderEvents,
+  plainErrors = false,
+  tickSize,
+}: {
+  challengeId: string;
+  symbol: string;
+  maxQuantity: number;
+  minPosition?: number;
+  maxPosition?: number;
+  maxOpenOrders?: number;
+  refreshKey?: number;
+  price: string;
+  onPriceChange: (v: string) => void;
+  refPrice?: number;
+  frozen?: boolean;
+  /** Cash at or below the margin floor: sells only. */
+  buysBlocked?: boolean;
+  positionQty?: number;
+  qtyPresets?: [number, number, number, number];
+  /** Instrument not tradable yet (e.g. "NEURO is not listed yet ..."). */
+  lockedMessage?: string;
+  /** Live order events; the ticket explains rejections of its own orders. */
+  orderEvents?: Array<OrderEvent & { seq: number }>;
+  /** Fresher Sprint wording for every rejection reason. */
+  plainErrors?: boolean;
+  /** Validate limit prices against this tick before sending. */
+  tickSize?: number;
+}) {
+  const router = useRouter();
+  const user = useAuth((s) => s.user);
+  const isAdmin = user?.role === "admin";
+  const [side, setSide] = useState<OrderSide>("buy");
+  const [type, setType] = useState<TicketKind>("limit");
+  const [quantity, setQuantity] = useState("10");
+  const [status, setStatus] = useState<{
+    kind: "ok" | "err";
+    msg: string;
+  } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [openOrders, setOpenOrders] = useState<Order[]>([]);
+  const sent = useRef(
+    new Map<string, { type: TicketKind; qty: number; side: OrderSide; symbol: string }>(),
+  );
+  const seenSeq = useRef(orderEvents?.at(-1)?.seq ?? 0);
+  const eventsRef = useRef(orderEvents);
+  eventsRef.current = orderEvents;
+  const explain = useCallback(
+    (e: OrderEvent) => {
+      const mine = sent.current.get(e.orderId);
+      if (!mine) return;
+      if (e.status === "rejected") {
+        sent.current.delete(e.orderId);
+        setStatus({
+          kind: "err",
+          msg: orderRejectText(e.reason, {
+            symbol: mine.symbol,
+            maxQuantity,
+            maxOpenOrders,
+          }),
+        });
+      } else if (e.status === "cancelled" && mine.type !== "limit") {
+        // A market or IOC remainder with nobody on the other side.
+        sent.current.delete(e.orderId);
+        const filled = mine.qty - e.remainingQuantity;
+        const nobody = mine.side === "buy" ? "sellers" : "buyers";
+        setStatus({
+          kind: filled > 0 ? "ok" : "err",
+          msg:
+            filled > 0
+              ? `Filled ${filled} of ${mine.qty}; no more ${nobody} right now. Try a limit order for the rest.`
+              : `No ${nobody} right now. Try a limit order.`,
+        });
+      } else if (e.status === "filled") {
+        sent.current.delete(e.orderId);
+        setStatus({
+          kind: "ok",
+          msg: `Filled: ${mine.side === "buy" ? "bought" : "sold"} ${mine.qty} ${mine.symbol}.`,
+        });
+      }
+    },
+    [maxQuantity, maxOpenOrders],
+  );
+  useEffect(() => {
+    if (!orderEvents) return;
+    for (const e of orderEvents) {
+      if (e.seq <= seenSeq.current) continue;
+      seenSeq.current = e.seq;
+      explain(e);
+    }
+  }, [orderEvents, explain]);
+
+  const loadOpen = useCallback(() => {
+    if (!user) {
+      setOpenOrders([]);
+      return;
+    }
+    get<Order[]>(`/api/orders?challengeId=${challengeId}&open=true`)
+      .then(setOpenOrders)
+      .catch(() => {});
+  }, [challengeId, user]);
+
+  useEffect(() => {
+    loadOpen();
+  }, [loadOpen, refreshKey]);
+
+  useEffect(() => {
+    if (buysBlocked && side === "buy") setSide("sell");
+  }, [buysBlocked, side]);
+
+  const openBuyQty = openOrders
+    .filter((o) => o.symbol === symbol && o.side === "buy")
+    .reduce((s, o) => s + o.remainingQuantity, 0);
+  const openSellQty = openOrders
+    .filter((o) => o.symbol === symbol && o.side === "sell")
+    .reduce((s, o) => s + o.remainingQuantity, 0);
+  const remainingCap = isAdmin
+    ? Number.POSITIVE_INFINITY
+    : Math.max(
+        0,
+        side === "buy"
+          ? maxPosition - positionQty - openBuyQty
+          : positionQty - minPosition - openSellQty,
+      );
+  const atCountCap = openOrders.length >= maxOpenOrders;
+  const atSizeCap = !isAdmin && remainingCap <= 0;
+  const qtyCap = Math.min(remainingCap, maxQuantity);
+
+  async function submit() {
+    if (!user) {
+      router.push(`/login?next=/challenges/${challengeId}`);
+      return;
+    }
+    if (lockedMessage) {
+      setStatus({ kind: "err", msg: lockedMessage });
+      return;
+    }
+    if (frozen) {
+      setStatus({
+        kind: "err",
+        msg: plainErrors
+          ? orderRejectText("market_paused", { symbol })
+          : "Market frozen — cancellations only.",
+      });
+      return;
+    }
+    if (type !== "market") {
+      const lp = parseFloat(price);
+      const offGrid =
+        tickSize != null &&
+        tickSize > 0 &&
+        Math.abs(lp / tickSize - Math.round(lp / tickSize)) > 1e-6;
+      if (!Number.isFinite(lp) || lp <= 0 || offGrid) {
+        setStatus({
+          kind: "err",
+          msg: plainErrors
+            ? orderRejectText("invalid_price", { symbol })
+            : "Enter a positive limit price.",
+        });
+        return;
+      }
+    }
+    if (buysBlocked && side === "buy") {
+      setStatus({
+        kind: "err",
+        msg: "Cash below limit — sells only.",
+      });
+      return;
+    }
+    const qty = Number(quantity);
+    if (!Number.isInteger(qty) || qty <= 0 || (!isAdmin && qty > qtyCap)) {
+      setStatus({
+        kind: "err",
+        msg: `Enter a whole quantity from 1 to ${qtyCap}.`,
+      });
+      return;
+    }
+    if (openOrders.length >= maxOpenOrders) {
+      setStatus({
+        kind: "err",
+        msg: `Open order limit reached (${maxOpenOrders}). Cancel one to place another.`,
+      });
+      return;
+    }
+    if (!isAdmin && remainingCap <= 0) {
+      setStatus({
+        kind: "err",
+        msg:
+          side === "buy"
+            ? "No buy room at the current inventory and working orders."
+            : "No sell room at the current inventory and working orders.",
+      });
+      return;
+    }
+    setStatus(null);
+    setSubmitting(true);
+    try {
+      const orderType: OrderType = type === "ioc" ? "limit" : type;
+      const limitPrice = parseFloat(price);
+      const body = {
+        challengeId,
+        symbol,
+        side,
+        type: orderType,
+        quantity: qty,
+        ...(orderType === "limit" ? { price: limitPrice } : {}),
+        ...(type === "ioc" ? { timeInForce: "IOC" as const } : {}),
+      };
+      const ack = await post<{
+        orderId: string;
+        status: string;
+        quantity?: number;
+      }>("/api/orders", body);
+      const accepted = ack.quantity ?? qty;
+      if (ack.orderId) {
+        sent.current.set(ack.orderId, { type, qty: accepted, side, symbol });
+        // The engine can answer over the socket before this HTTP reply.
+        for (const e of eventsRef.current ?? [])
+          if (e.orderId === ack.orderId) explain(e);
+      }
+      setOpenOrders((cur) => [
+        ...cur,
+        {
+          id: ack.orderId ?? `local-${Date.now()}`,
+          challengeId,
+          userId: user.id,
+          symbol,
+          side,
+          type: orderType,
+          quantity: accepted,
+          remainingQuantity: accepted,
+          price: orderType === "limit" ? limitPrice : null,
+          status: "open",
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+      loadOpen();
+      const capped = accepted < qty;
+      setStatus({
+        kind: "ok",
+        msg: `${side === "buy" ? "Buy" : "Sell"} ${accepted} ${formatInstrumentLabel(symbol)} submitted.${
+          capped ? ` (capped from ${qty})` : ""
+        }${type === "ioc" ? " IOC." : ""}`,
+      });
+    } catch (err) {
+      const code =
+        err instanceof ApiError
+          ? (err.body as { error?: string })?.error
+          : undefined;
+      if (plainErrors) {
+        setStatus({
+          kind: "err",
+          msg: orderRejectText(code, { symbol, maxQuantity, maxOpenOrders }),
+        });
+        return;
+      }
+      setStatus({
+        kind: "err",
+        msg:
+          code === "challenge_not_live"
+            ? "Challenge is not live."
+            : code === "market_frozen"
+              ? "Market frozen — cancellations only."
+              : code === "buys_blocked"
+                ? "Cash below limit — sells only."
+              : code === "no_capacity"
+                ? side === "buy"
+                  ? "No buy room at the current inventory and working orders."
+                  : "No sell room at the current inventory and working orders."
+                : code === "quantity_exceeds_limit"
+                  ? `Max order size is ${maxQuantity}.`
+                  : code === "open_orders_exceeded"
+                    ? "Too many open orders. Cancel one to place another."
+                    : code === "open_quantity_exceeded"
+                      ? `Working size would exceed the ${maxQuantity} unit cap. Cancel or reduce size.`
+                      : code === "rate_limited"
+                        ? "Too many orders. Slow down and retry."
+                        : code === "volume_limited"
+                          ? "Volume limit reached for this minute. Wait and retry."
+                          : code === "validation_error"
+                            ? "Check your order details."
+                            : "Order rejected.",
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Panel className="flex min-w-0 flex-col overflow-hidden">
+      <PanelHeader title="Order entry">
+        <span className="mono truncate text-xs text-text">
+          {formatInstrumentLabel(symbol)}
+        </span>
+      </PanelHeader>
+      <div className="flex flex-1 flex-col gap-3 p-4">
+        <p className="text-xs text-muted">
+          Inventory {minPosition} to +{maxPosition}; {maxQuantity} units per
+          order.
+        </p>
+        {buysBlocked && (
+          <p className="text-xs text-down">
+            Cash below limit — working buys cancelled. Sells only.
+          </p>
+        )}
+        <div
+          role="group"
+          aria-label="Order side"
+          className="grid grid-cols-2 gap-1 rounded-md border border-border bg-surface-2 p-1"
+        >
+          <button
+            type="button"
+            onClick={() => setSide("buy")}
+            aria-pressed={side === "buy"}
+            disabled={buysBlocked}
+            className={cn(
+              "h-9 rounded-sm text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-accent",
+              buysBlocked
+                ? "cursor-not-allowed text-faint"
+                : side === "buy"
+                  ? "bg-up-subtle text-up ring-1 ring-up/40"
+                  : "text-muted hover:text-text",
+            )}
+          >
+            Buy
+          </button>
+          <button
+            type="button"
+            onClick={() => setSide("sell")}
+            aria-pressed={side === "sell"}
+            className={cn(
+              "h-9 rounded-sm text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-accent",
+              side === "sell"
+                ? "bg-down-subtle text-down ring-1 ring-down/40"
+                : "text-muted hover:text-text",
+            )}
+          >
+            Sell
+          </button>
+        </div>
+
+        <Field label="Order type">
+          <Select
+            value={type}
+            onChange={(e) => setType(e.target.value as TicketKind)}
+          >
+            <option value="limit">Limit</option>
+            <option value="market">Market</option>
+            <option value="ioc">IOC</option>
+          </Select>
+        </Field>
+
+        <Field label={isAdmin ? "Quantity" : `Quantity (up to ${qtyCap})`}>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            className="mono"
+          />
+        </Field>
+
+        <div className="grid grid-cols-4 gap-1.5">
+          {qtyPresets.map((n) => (
+            <button
+              key={n}
+              type="button"
+              aria-label={`Set quantity to ${n}`}
+              onClick={() => setQuantity(String(n))}
+              className="h-7 rounded-md border border-border bg-surface-2 text-xs text-muted transition-colors hover:border-border-strong hover:text-text focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+
+        {(type === "limit" || type === "ioc") && (
+          <Field label="Limit price">
+            <Input
+              type="number"
+              step="0.01"
+              value={price}
+              onChange={(e) => onPriceChange(e.target.value)}
+              className="mono"
+            />
+          </Field>
+        )}
+
+        {type === "market" && (
+          <p className="rounded-md border border-border bg-surface-2 px-3 py-2 text-xs leading-relaxed text-muted">
+            Executes against available liquidity. The final price may differ
+            from the last trade.
+          </p>
+        )}
+
+        {type === "ioc" && (
+          <p className="rounded-md border border-border bg-surface-2 px-3 py-2 text-xs leading-relaxed text-muted">
+            Immediate-or-cancel: fill what is available at this price and
+            cancel the rest.
+          </p>
+        )}
+
+        <Button
+          variant={side === "buy" ? "buy" : "sell"}
+          className="mt-auto w-full"
+          size="lg"
+          loading={submitting}
+          disabled={
+            Boolean(lockedMessage) ||
+            frozen ||
+            (buysBlocked && side === "buy") ||
+            (Boolean(user) && (atCountCap || atSizeCap))
+          }
+          onClick={submit}
+        >
+          {lockedMessage
+            ? "Not listed yet"
+            : frozen
+            ? plainErrors
+              ? "Market paused"
+              : "Market frozen"
+            : user
+              ? atCountCap
+                ? "Open order limit reached"
+                : atSizeCap
+                  ? side === "buy"
+                    ? "No buy room"
+                    : "No sell room"
+                  : `${side === "buy" ? "Buy" : "Sell"} ${formatInstrumentLabel(symbol)}`
+              : "Sign in to trade"}
+        </Button>
+
+        {lockedMessage && (
+          <p className="rounded-md border border-border bg-surface-2 px-3 py-2 text-xs text-muted">
+            {lockedMessage}
+          </p>
+        )}
+        {status && (
+          <div
+            role={status.kind === "err" ? "alert" : "status"}
+            className={cn(
+              "rounded-md px-3 py-2 text-xs",
+              status.kind === "ok"
+                ? "border border-up/30 bg-up-subtle text-up"
+                : "border border-down/30 bg-down-subtle text-down",
+            )}
+          >
+            {status.msg}
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
+}

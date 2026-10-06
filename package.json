@@ -1,0 +1,33 @@
+{
+  "name": "fresher-sprint-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fresher Sprint: a 30-minute live trading simulation for Quant Club, IIT Bombay.",
+  "packageManager": "pnpm@11.8.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "db:generate": "pnpm --filter @qtp/db db:generate",
+    "db:migrate": "pnpm --filter @qtp/db db:migrate",
+    "db:push": "pnpm --filter @qtp/db db:push",
+    "db:seed": "pnpm --filter @qtp/db db:seed",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\"",
+    "db:seed-loadtest": "pnpm --filter @qtp/db db:seed-loadtest",
+    "event:up": "docker compose -f docker-compose.event.yml --env-file .env.event up -d --build",
+    "event:down": "docker compose -f docker-compose.event.yml --env-file .env.event down",
+    "dryrun": "node scripts/dryrun-fresher.mjs"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.3"
+  }
+}

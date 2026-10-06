@@ -1,0 +1,2246 @@
+import { ChallengeEngine, computeScore } from "@qtp/core";
+import {
+  addListedSymbol,
+  appendEvents,
+  createRedis,
+  getFairValue,
+  getPrice,
+  getTraderMetricsMap,
+  publishBroadcast,
+  pushNews,
+  readCheckpointRedis,
+  readCommands,
+  setBookSnapshot,
+  setFairValue,
+  setMidPrice,
+  setMarketFrozen,
+  setPrice,
+  setSymbolTradeable,
+  setTraderMetrics,
+  type Redis,
+} from "@qtp/bus";
+import { and, asc, eq, inArray, isNotNull, isNull, lte, or } from "drizzle-orm";
+import {
+  challengeNews,
+  challenges,
+  engineCheckpoints,
+  eventActions,
+  fairValues,
+  loans,
+  orders,
+  participants,
+  positions,
+  saveChallengeCheckpoint,
+  type Challenge,
+  type Database,
+} from "@qtp/db";
+import {
+  midFromBook,
+  redisKeys,
+  zEdenConfig,
+  zEdenOptionsConfig,
+  zEdenRules,
+  edenEventEndsAt,
+  edenEventFlow,
+  edenEventStateAt,
+  EDEN_DEMO_ACTIONS,
+  EDEN_DEMO_CUES,
+  EDEN_DEMO_VERSION,
+  EDEN_EVENT_ACTIONS,
+  EDEN_EVENT_DURATION_MINUTES,
+  EDEN_EVENT_NEWS,
+  isFresherEden,
+  scriptActions,
+  scriptCues,
+  scriptDurationMinutes,
+  EDEN_EVENT_SHOCK_MINUTE,
+  EDEN_EVENT_VERSION,
+  type BroadcastEnvelope,
+  type BondTemplate,
+  type BotConfig,
+  type ChallengeConfig,
+  type EdenBotConfig,
+  type EdenConfig,
+  type EdenEventAction,
+  type EngineCommand,
+  type EngineEvent,
+  type EtfConfig,
+  type NewsItem,
+  type SymbolConfig,
+  type TraderMetrics,
+} from "@qtp/shared";
+import { env } from "./env.js";
+import { BotEngine } from "./bots.js";
+import { EdenBotEngine } from "./eden-bots.js";
+import { OptionsManager } from "./options-manager.js";
+import { MarketsManager } from "./markets-manager.js";
+import { Persistence } from "./persistence.js";
+import { EdenSettlements } from "./eden-settlements.js";
+import { CueTimeline } from "./cue-timeline.js";
+import {
+  EventTimeline,
+  eventActionUuid,
+  type EventActionContext,
+} from "./event-timeline.js";
+import { EventExecutor } from "./event-executor.js";
+import { finalizeScores } from "./final-scoring.js";
+
+/** After a margin warning, traders may borrow before forced flatten. */
+export const MARGIN_BORROW_GRACE_MS = 30_000;
+
+/**
+ * Owns the in-memory matching engine for one challenge: consumes its command
+ * stream, mutates state, persists asynchronously, and publishes events.
+ */
+export class ChallengeRunner {
+  private readonly engine: ChallengeEngine;
+  private readonly persistence: Persistence;
+  private readonly settlements: EdenSettlements;
+  private timeline?: EventTimeline;
+  private cues?: CueTimeline;
+  private work: Promise<void> = Promise.resolve();
+  private commandWork?: Promise<void>;
+  private poisoned = false;
+  private leaseLost = false;
+  private finalized = false;
+  private clockBusy = false;
+  private botBusy = false;
+  private priceBusy = false;
+  private recoveryAt = 0;
+  private readonly scriptedNews = new Set<string>();
+  /** Fresher fallback: the host fires beats; the clock-driven script waits. */
+  private scriptManual = false;
+  private newsBusy = false;
+  private readonly marginNotices = new Map<string, number>();
+  /** Flatten alert already sent for the current breach; later ticks stay silent. */
+  private readonly marginFlattenNotified = new Set<string>();
+  private readonly bots: BotEngine;
+  private edenBots?: EdenBotEngine;
+  private options?: OptionsManager;
+  private markets?: MarketsManager;
+  private minuteCount = 0;
+  private readonly cmdRedis: Redis;
+  private running = false;
+  /** Stream cursor. See `loadCommandCursor`. */
+  private lastId = "0-0";
+  private tickTimer?: NodeJS.Timeout;
+  private flushTimer?: NodeJS.Timeout;
+  private botTimer?: NodeJS.Timeout;
+  private metricsTimer?: NodeJS.Timeout;
+  private minuteTimer?: NodeJS.Timeout;
+  private newsTimer?: NodeJS.Timeout;
+  private checkpointTimer?: NodeJS.Timeout;
+  private checkpointBusy = false;
+  private eden?: EdenConfig;
+  private readonly edenEnabled: boolean;
+  private frozen: boolean;
+
+  constructor(
+    private readonly redis: Redis,
+    private readonly db: Database,
+    private readonly challenge: Challenge,
+  ) {
+    // `eden` config drives the options/ETF managers for ANY challenge type
+    // (so instruments introduced live survive a runner restart); the full New
+    // Eden bot ecosystem + rules only activate for `new_eden` challenges.
+    this.eden = challenge.config.eden;
+    this.edenEnabled =
+      challenge.type === "new_eden" && !!this.eden?.rules.enabled;
+    this.frozen = challenge.frozen ?? false;
+    this.engine = new ChallengeEngine({
+      challengeId: challenge.id,
+      symbols: challenge.config.symbols,
+      startingCash: challenge.config.startingCash,
+      minPosition: challenge.config.minPosition,
+      maxPosition: challenge.config.maxPosition,
+      maxOrderQuantity: challenge.config.maxOrderQuantity,
+      ...(this.edenEnabled
+        ? { positionCap: this.eden!.rules.positionCap }
+        : {}),
+      maxOpenOrders: challenge.config.maxOpenOrders ?? 25,
+      allowMargin: challenge.config.allowMargin,
+      ...(challenge.config.strictRisk ? { strictRisk: true } : {}),
+    });
+    this.applyBuyCashFloor();
+    this.engine.setFrozen(this.frozen);
+    this.persistence = new Persistence(db, challenge.id, this.engine);
+    this.persistence.setCommitGuard(() => {
+      if (this.leaseLost)
+        throw new Error("Engine lease lost before checkpoint commit");
+    });
+    this.settlements = new EdenSettlements({
+      engine: this.engine,
+      db,
+      redis,
+      challenge,
+      minuteMs: env.minuteMs,
+      persistence: this.persistence,
+      emit: (events) => this.emit(events),
+      refreshPortfolios: (ids, ts) => this.refreshPortfolios(ids, ts),
+    });
+    this.bots = new BotEngine(
+      this.engine,
+      challenge.config.bots ?? {
+        marketMakers: 0,
+        noiseTraders: 0,
+        spread: 0.5,
+        quoteSize: 5,
+        intensity: 0.5,
+      },
+      challenge.config.symbols,
+    );
+    // New Eden challenges run the four-archetype bot ecosystem instead.
+    if (this.edenEnabled && this.eden?.bots) {
+      this.edenBots = new EdenBotEngine(
+        this.engine,
+        this.eden.bots,
+        challenge.config.symbols,
+      );
+    }
+    if (this.eden?.options?.enabled) {
+      this.options = new OptionsManager(
+        this.engine,
+        this.redis,
+        this.db,
+        challenge,
+        this.eden.options,
+        this.eden.rules ?? zEdenRules.parse({}),
+        env.minuteMs,
+        (events) => this.emit(events),
+        (userIds, ts) => this.refreshPortfolios(userIds, ts),
+      );
+    }
+    if (
+      (this.eden?.bonds?.length ?? 0) > 0 ||
+      (this.eden?.etfs?.length ?? 0) > 0
+    ) {
+      this.markets = new MarketsManager(
+        this.engine,
+        this.redis,
+        this.db,
+        challenge,
+        this.eden?.bonds ?? [],
+        this.eden?.etfs ?? [],
+        env.minuteMs,
+        (events) => this.emit(events),
+        (userIds, ts) => this.refreshPortfolios(userIds, ts),
+      );
+    }
+    this.cmdRedis = createRedis(env.redisUrl);
+  }
+
+  get challengeId(): string {
+    return this.challenge.id;
+  }
+
+  get healthy(): boolean {
+    return !this.poisoned;
+  }
+
+  invalidateLease(): void {
+    this.leaseLost = true;
+    this.running = false;
+    this.poisoned = true;
+    this.engine.setFrozen(true);
+    this.options?.stop();
+    this.markets?.stop();
+    this.cmdRedis.disconnect();
+  }
+
+  /** ENGINE_PROFILE=1: time spent per mutation-queue task kind, logged every 10 s. */
+  private profLabel = "other";
+  private profStats = new Map<string, { n: number; ms: number; max: number }>();
+  private profLoggedAt = Date.now();
+  private profile(label: string, ms: number): void {
+    const key = label.startsWith("cmds:") ? "cmds" : label;
+    const s = this.profStats.get(key) ?? { n: 0, ms: 0, max: 0 };
+    s.n++;
+    s.ms += ms;
+    s.max = Math.max(s.max, ms);
+    this.profStats.set(key, s);
+    const now = Date.now();
+    if (now - this.profLoggedAt < 10_000) return;
+    const span = now - this.profLoggedAt;
+    const parts = [...this.profStats.entries()]
+      .sort((a, b) => b[1].ms - a[1].ms)
+      .map(
+        ([k, v]) =>
+          `${k} n=${v.n} busy=${((100 * v.ms) / span).toFixed(0)}% avg=${(v.ms / v.n).toFixed(1)}ms max=${v.max.toFixed(0)}ms`,
+      );
+    console.log(`[profile ${this.challenge.slug}] ${parts.join(" | ")}`);
+    this.profStats.clear();
+    this.profLoggedAt = now;
+  }
+
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    const next = this.work.then(async () => {
+      if (this.poisoned || !this.running) return;
+      const started = env.profile ? performance.now() : 0;
+      this.profLabel = "other";
+      try {
+        if (this.edenEnabled) await this.settlements.reserveOtc(Date.now());
+        await task();
+        if (this.leaseLost) throw new Error("Engine lease lost");
+        await this.persistence.flush({ minuteCount: this.minuteCount });
+        if (env.profile)
+          this.profile(this.profLabel, performance.now() - started);
+      } catch (error) {
+        // Do not execute subsequent commands against partially committed state.
+        // Reconciliation restores the last committed checkpoint into a new runner.
+        this.poisoned = true;
+        this.running = false;
+        this.options?.stop();
+        this.markets?.stop();
+        throw error;
+      }
+    });
+    this.work = next.catch((error) =>
+      console.error(`[${this.challenge.slug}] mutation failed`, error),
+    );
+    return next;
+  }
+
+  private dispatch = (task: () => Promise<void>): void => {
+    if (this.running) void this.enqueue(task).catch(() => {});
+  };
+
+  async start(): Promise<void> {
+    this.running = true;
+    // Persist the event epoch once; deployments must never restart its clock.
+    if (!this.challenge.startsAt) {
+      this.challenge.startsAt = new Date();
+      await this.db
+        .update(challenges)
+        .set({ startsAt: this.challenge.startsAt })
+        .where(eq(challenges.id, this.challenge.id));
+    }
+    const scriptedMinutes = this.eden?.script
+      ? scriptDurationMinutes(this.eden.script)
+      : this.eden?.eventScript
+        ? EDEN_EVENT_DURATION_MINUTES
+        : 0;
+    if (scriptedMinutes > 0) {
+      this.challenge.endsAt = new Date(
+        this.challenge.startsAt.getTime() + scriptedMinutes * env.minuteMs,
+      );
+      await this.db
+        .update(challenges)
+        .set({ endsAt: this.challenge.endsAt })
+        .where(eq(challenges.id, this.challenge.id));
+    }
+    // A scripted market opens at minute 0 (`market_open`), even if the host
+    // flips the challenge live before startsAt.
+    if (
+      this.edenEnabled &&
+      scriptedMinutes > 0 &&
+      !this.frozen &&
+      Date.now() < this.challenge.startsAt.getTime()
+    ) {
+      this.frozen = true;
+      this.challenge.frozen = true;
+      await this.db
+        .update(challenges)
+        .set({ frozen: true })
+        .where(eq(challenges.id, this.challenge.id));
+    }
+    const checkpoint = await this.db.query.engineCheckpoints.findFirst({
+      where: eq(engineCheckpoints.challengeId, this.challenge.id),
+    });
+    if (checkpoint) {
+      this.engine.restoreState(checkpoint.state);
+      this.applyBuyCashFloor();
+      this.lastId = checkpoint.cursor;
+      this.minuteCount = checkpoint.minuteCount;
+    } else {
+      const accounts = await this.db
+        .select()
+        .from(participants)
+        .where(eq(participants.challengeId, this.challenge.id));
+      const holdings = await this.db
+        .select()
+        .from(positions)
+        .where(eq(positions.challengeId, this.challenge.id));
+      const metrics = await getTraderMetricsMap(this.redis, this.challenge.id);
+      for (const account of accounts) {
+        const m = metrics.get(account.userId);
+        this.engine.restoreAccount(account.userId, {
+          cash: account.cash,
+          loanDebt: account.loanDebt,
+          positions: holdings.filter((p) => p.userId === account.userId),
+          ...(m
+            ? { metrics: { ...m, quoteUptimeMs: m.quoteUptime * 1000 } }
+            : {}),
+        });
+      }
+      this.lastId = await this.loadCommandCursor();
+    }
+    this.engine.setFrozen(this.frozen);
+    // Publish initial price + book snapshots so late joiners see state.
+    const now = Date.now();
+    for (const s of this.challenge.config.symbols) {
+      // Resume from persisted price if one exists, else seed the initial.
+      const persisted = await getPrice(this.redis, this.challenge.id, s.symbol);
+      if (!checkpoint && persisted != null)
+        this.engine.restorePrice(s.symbol, persisted);
+      const price = this.engine.getPrice(s.symbol) ?? s.initialPrice;
+      await setPrice(this.redis, this.challenge.id, s.symbol, price, now);
+      // New Eden: seed/restore fair value (defaults to the initial price).
+      if (this.edenEnabled) {
+        const persistedFv = await getFairValue(
+          this.redis,
+          this.challenge.id,
+          s.symbol,
+        );
+        const fv = this.engine.setFairValue(
+          s.symbol,
+          this.engine.getFairValue(s.symbol) ?? persistedFv ?? s.initialPrice,
+        );
+        await setFairValue(this.redis, this.challenge.id, s.symbol, fv);
+      }
+      const snap = this.engine.snapshot(s.symbol);
+      const mid = midFromBook(snap.bids, snap.asks) ?? price;
+      await setMidPrice(this.redis, this.challenge.id, s.symbol, mid, now);
+      await setBookSnapshot(this.redis, this.challenge.id, {
+        symbol: s.symbol,
+        bids: snap.bids,
+        asks: snap.asks,
+        sequence: 0,
+      });
+    }
+
+    const persistedFvs = await this.db
+      .select()
+      .from(fairValues)
+      .where(eq(fairValues.challengeId, this.challenge.id));
+    for (const fv of persistedFvs)
+      this.engine.setFairValue(fv.symbol, fv.fairValue);
+    // Driver quote IDs are process-local; retain bot inventory, not stale quotes.
+    const botCancels: EngineEvent[] = [];
+    for (const id of this.engine.accountIds()) {
+      if (id.startsWith("bot:"))
+        botCancels.push(...this.engine.cancelUserOrders(id, Date.now()));
+    }
+    this.persistence.collect(botCancels);
+    this.options?.setDispatcher(this.dispatch);
+    this.options?.setPersistence(this.persistence);
+    this.markets?.setDispatcher(this.dispatch);
+    this.markets?.setPersistence(this.persistence);
+    if (this.options) await this.options.start();
+    if (this.markets) await this.markets.start();
+    if (!this.options && this.engine.optionMetas().length > 0) {
+      await this.ensureOptions(false);
+    }
+    this.edenBots?.restore(Date.now());
+    this.edenBots?.setEtfs(this.challenge.config.eden?.etfs ?? []);
+    if (!checkpoint && this.lastId !== "0-0") {
+      const resting = await this.db
+        .select()
+        .from(orders)
+        .where(
+          and(
+            eq(orders.challengeId, this.challenge.id),
+            inArray(orders.status, ["open", "partially_filled"]),
+          ),
+        )
+        .orderBy(asc(orders.createdAt), asc(orders.id));
+      let seq = 0;
+      for (const order of resting) {
+        if (order.type !== "limit" || order.price == null) continue;
+        this.engine.restoreRestingOrder(order.symbol, {
+          id: order.id,
+          userId: order.userId,
+          side: order.side,
+          price: order.price,
+          remaining: order.remainingQuantity,
+          seq: ++seq,
+        });
+      }
+    }
+    await this.configureTimeline();
+    if (this.edenEnabled) await this.settlements.recoverPremium(Date.now());
+    await this.syncMarketStatus();
+    await this.persistence.flush({
+      cursor: this.lastId,
+      minuteCount: this.minuteCount,
+    });
+    await this.enqueue(() => this.advanceClock(Date.now()));
+
+    if (this.finalized) return;
+    this.commandWork = this.commandLoop();
+    if (this.challenge.config.autonomousPrice) {
+      this.tickTimer = setInterval(() => {
+        if (!this.running || this.priceBusy) return;
+        this.priceBusy = true;
+        void this.enqueue(async () => {
+          this.profLabel = "tick";
+          await this.advanceClock(Date.now());
+          await this.tick();
+        })
+          .catch(() => {})
+          .finally(() => {
+            this.priceBusy = false;
+          });
+      }, env.tickMs);
+    }
+    if (this.edenEnabled) {
+      this.minuteTimer = setInterval(
+        () => {
+          if (!this.running || this.clockBusy) return;
+          this.clockBusy = true;
+          void this.enqueue(
+            () => ((this.profLabel = "clock"), this.advanceClock(Date.now())),
+          )
+            .catch(() => {})
+            .finally(() => {
+              this.clockBusy = false;
+            });
+        },
+        Math.min(250, env.minuteMs / 60),
+      );
+    }
+    if (this.edenBots?.enabled || this.bots.enabled) {
+      this.botTimer = setInterval(() => {
+        if (!this.running || this.botBusy) return;
+        this.botBusy = true;
+        void this.enqueue(async () => {
+          this.profLabel = "bots";
+          await this.advanceClock(Date.now());
+          await this.botTick();
+        })
+          .catch(() => {})
+          .finally(() => {
+            this.botBusy = false;
+          });
+      }, env.botMs);
+    }
+    this.flushTimer = setInterval(() => {
+      if (this.running)
+        this.dispatch(
+          () => ((this.profLabel = "flushTimer"), this.persistence.flush()),
+        );
+    }, env.flushMs);
+    this.metricsTimer = setInterval(() => {
+      if (this.running)
+        this.dispatch(
+          () => ((this.profLabel = "metrics"), this.publishMetrics()),
+        );
+    }, env.metricsMs);
+    // Publish any scheduled news items whose publish time has arrived. The
+    // runner holds the per-challenge engine lock, so it is the single writer.
+    this.newsTimer = setInterval(() => {
+      if (!this.running || this.newsBusy) return;
+      this.newsBusy = true;
+      void this.enqueue(
+        () => ((this.profLabel = "news"), this.publishDueNews()),
+      )
+        .catch(() => {})
+        .finally(() => {
+          this.newsBusy = false;
+        });
+    }, 250);
+    // On the mutation queue so the snapshot matches the book it describes.
+    this.checkpointTimer = setInterval(() => {
+      if (!this.running || this.checkpointBusy) return;
+      this.checkpointBusy = true;
+      void this.enqueue(() => this.saveCheckpoint())
+        .catch(() => {})
+        .finally(() => {
+          this.checkpointBusy = false;
+        });
+    }, env.checkpointMs);
+    console.log(`[engine] running challenge ${this.challenge.slug}`);
+    const restoredFrom = await this.redis.getdel(
+      redisKeys.restored(this.challenge.id),
+    );
+    if (restoredFrom) {
+      await publishBroadcast(this.redis, this.challenge.id, [
+        {
+          target: "all",
+          msg: {
+            type: "session_restored",
+            challengeId: this.challenge.id,
+            data: { takenAt: restoredFrom, ts: Date.now() },
+          },
+        },
+      ]);
+    }
+  }
+
+  /** Rewind point for the host. A failed snapshot never stops trading. */
+  private async saveCheckpoint(): Promise<void> {
+    if (this.finalized) return;
+    try {
+      await this.persistence.flush({ minuteCount: this.minuteCount });
+      await saveChallengeCheckpoint(this.db, {
+        challengeId: this.challenge.id,
+        takenAt: new Date(),
+        reason: "auto",
+        minuteMs: env.minuteMs,
+        engine: {
+          state: this.engine.exportState(),
+          minuteCount: this.minuteCount,
+        },
+        redis: await readCheckpointRedis(this.redis, this.challenge.id),
+      });
+    } catch (error) {
+      console.error(`[${this.challenge.slug}] checkpoint failed`, error);
+    }
+  }
+
+  /** Switch the Fresher script between clock-driven and host-fired beats. */
+  private async setScriptManual(manual: boolean): Promise<void> {
+    if (edenEventFlow(this.eden) !== "script") return;
+    this.scriptManual = manual;
+    if (manual) await this.redis.set(redisKeys.scriptManual(this.challenge.id), "1");
+    else await this.redis.del(redisKeys.scriptManual(this.challenge.id));
+    console.log(
+      `[${this.challenge.slug}] script ${manual ? "manual (host-fired)" : "automatic"}`,
+    );
+    // Resuming the clock catches up every beat that is due and not yet run.
+    if (!manual) await this.advanceClock(Date.now());
+  }
+
+  /**
+   * Run one scripted beat now. Its actions are re-based to the fire time and
+   * share receipts with the clock, so neither path can run an action twice.
+   */
+  private async runScriptCue(cueId: string, now: number): Promise<void> {
+    const script = this.eden?.script;
+    if (!script || edenEventFlow(this.eden) !== "script") return;
+    const cue = scriptCues(script).find((c) => c.id === cueId);
+    if (!cue) return;
+    const done = new Set(
+      (
+        await this.db
+          .select({ actionId: eventActions.actionId })
+          .from(eventActions)
+          .where(eq(eventActions.challengeId, this.challenge.id))
+      ).map((r) => r.actionId),
+    );
+    const executor = this.createExecutor();
+    const secondMs = env.minuteMs / 60;
+    const anchor = cue.actions[0]?.atSecond ?? 0;
+    for (const action of cue.actions) {
+      if (done.has(action.id) || this.finalized) continue;
+      await executor.execute(action, {
+        challengeId: this.challenge.id,
+        actionUuid: eventActionUuid(this.challenge.id, action.id),
+        scheduledAt: now,
+        now,
+        secondMs,
+        lateByMs: 0,
+        timestampAtSecond: (second) => now + (second - anchor) * secondMs,
+        resourceUuid: (key) => eventActionUuid(this.challenge.id, key),
+      });
+      await this.persistence.flush({
+        receipt: action.id,
+        minuteCount: this.minuteCount,
+      });
+      this.timeline?.markCompleted(action.id);
+    }
+    console.log(`[${this.challenge.slug}] host fired beat ${cueId}`);
+  }
+
+  /** A cue sheet runs for its event duration from the moment `open` fires. */
+  private async pinCueSheetEnd(): Promise<void> {
+    const openedAt = this.cues?.firedAt("open");
+    if (openedAt === undefined || !this.challenge.startsAt) return;
+    const end = edenEventEndsAt(
+      edenEventFlow(this.eden),
+      this.challenge.startsAt.getTime(),
+      openedAt,
+      env.minuteMs,
+    );
+    if (end == null || this.challenge.endsAt?.getTime() === end) return;
+    this.challenge.endsAt = new Date(end);
+    await this.db
+      .update(challenges)
+      .set({ endsAt: this.challenge.endsAt })
+      .where(eq(challenges.id, this.challenge.id));
+  }
+
+  async stop(persist = true): Promise<void> {
+    if (!persist) this.invalidateLease();
+    this.running = false;
+    this.options?.stop();
+    this.markets?.stop();
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.botTimer) clearInterval(this.botTimer);
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.metricsTimer) clearInterval(this.metricsTimer);
+    if (this.minuteTimer) clearInterval(this.minuteTimer);
+    if (this.newsTimer) clearInterval(this.newsTimer);
+    if (this.checkpointTimer) clearInterval(this.checkpointTimer);
+    // Disconnect the blocking reader before draining; no late batch can enqueue.
+    this.cmdRedis.disconnect();
+    await this.commandWork;
+    await this.work;
+    if (persist && !this.poisoned)
+      await this.persistence.flush({ minuteCount: this.minuteCount });
+    console.log(`[engine] stopped challenge ${this.challenge.slug}`);
+  }
+
+  private async commandLoop(): Promise<void> {
+    while (this.running) {
+      try {
+        const { nextId, messages } = await readCommands(
+          this.cmdRedis,
+          this.challenge.id,
+          this.lastId,
+          1000,
+        );
+        if (!this.running) break;
+        if (messages.length === 0) continue;
+        await this.enqueue(async () => {
+          await this.advanceClock(Date.now());
+          this.profLabel = `cmds:${messages.length}`;
+          // Group commit: orders and cancels only touch the in-memory book, so a
+          // run of them is matched first and then persisted + broadcast once.
+          // Any other command flushes that run before it executes. The batch's
+          // checkpoint and cursor commit together, so a crash replays the run.
+          let pending: EngineEvent[] = [];
+          let pendingId: string | null = null;
+          // Commit the run with the cursor of its own last command, never a
+          // later one, so a crash replays exactly what was not committed.
+          const flushRun = async () => {
+            if (pendingId == null) return;
+            this.persistence.setProgress({
+              cursor: pendingId,
+              minuteCount: this.minuteCount,
+            });
+            await this.emit(pending);
+            await this.persistence.flush();
+            this.lastId = pendingId;
+            pending = [];
+            pendingId = null;
+          };
+          for (const m of messages) {
+            if (this.finalized) break;
+            if (
+              m.data.type === "place_order" ||
+              m.data.type === "cancel_order"
+            ) {
+              pending.push(...(await this.process(m.data)));
+              pendingId = m.id;
+              continue;
+            }
+            await flushRun();
+            this.persistence.setProgress({
+              cursor: m.id,
+              minuteCount: this.minuteCount,
+            });
+            await this.emit(await this.process(m.data));
+            await this.persistence.flush();
+            this.lastId = m.id;
+          }
+          await flushRun();
+          await this.persistence.flush({
+            cursor: nextId,
+            minuteCount: this.minuteCount,
+          });
+          this.lastId = nextId;
+        });
+        await this.redis.set(
+          redisKeys.commandCursor(this.challenge.id),
+          this.lastId,
+        );
+      } catch (err) {
+        if (this.running) {
+          console.error(`[${this.challenge.slug}] command loop error`, err);
+          await sleep(500);
+        }
+      }
+    }
+  }
+
+  private async configureTimeline(): Promise<void> {
+    const flow = edenEventFlow(this.eden);
+    if (flow === "script")
+      this.scriptManual =
+        (await this.redis.get(redisKeys.scriptManual(this.challenge.id))) ===
+        "1";
+    if (!this.edenEnabled || flow === "host" || !this.challenge.startsAt)
+      return;
+    const executor = this.createExecutor();
+    const loadReceipts = () =>
+      this.db
+        .select()
+        .from(eventActions)
+        .where(eq(eventActions.challengeId, this.challenge.id));
+    const execute = async (
+      action: EdenEventAction,
+      context: EventActionContext,
+    ) => {
+      await executor.execute(action, context);
+      await this.persistence.flush({
+        receipt: action.id,
+        minuteCount: this.minuteCount,
+      });
+    };
+    if (flow === "demo" || flow === "cues") {
+      const demo = flow === "demo";
+      if (demo) {
+        for (const action of EDEN_DEMO_ACTIONS) {
+          if (action.kind === "news")
+            this.scriptedNews.add(
+              eventActionUuid(this.challenge.id, action.news.id),
+            );
+        }
+      } else {
+        for (const news of EDEN_EVENT_NEWS)
+          this.scriptedNews.add(eventActionUuid(this.challenge.id, news.id));
+      }
+      this.cues = new CueTimeline({
+        challengeId: this.challenge.id,
+        minuteMs: env.minuteMs,
+        ...(demo ? { cues: EDEN_DEMO_CUES } : {}),
+        loadReceipts,
+        recordFire: (actionId, at) =>
+          this.persistence.flush({
+            minuteCount: this.minuteCount,
+            write: async (tx) => {
+              await tx
+                .insert(eventActions)
+                .values({
+                  challengeId: this.challenge.id,
+                  actionId,
+                  completedAt: new Date(at),
+                })
+                .onConflictDoNothing();
+            },
+          }),
+        execute,
+      });
+      await this.cues.restore();
+      await this.pinCueSheetEnd();
+      const cues = this.cues;
+      if (!demo) {
+        this.setVolatility(
+          EDEN_EVENT_ACTIONS.reduce(
+            (multiplier, a) =>
+              a.kind === "bot_volatility" && cues.completed(a.id)
+                ? a.multiplier
+                : multiplier,
+            1,
+          ),
+        );
+      }
+      const openId = demo
+        ? `${EDEN_DEMO_VERSION}/open`
+        : `${EDEN_EVENT_VERSION}/open`;
+      if (!this.frozen && !cues.completed(openId)) {
+        this.frozen = true;
+        this.challenge.frozen = true;
+        this.engine.setFrozen(true);
+        await this.db
+          .update(challenges)
+          .set({ frozen: true })
+          .where(eq(challenges.id, this.challenge.id));
+      }
+      return;
+    }
+    if (flow === "script" && this.eden?.script) {
+      // Registered clock-driven script (Fresher Sprint). Its headlines are
+      // applied by the timeline only, never by the generic news poller.
+      const actions = scriptActions(this.eden.script);
+      for (const action of actions) {
+        if (action.kind === "news")
+          this.scriptedNews.add(
+            eventActionUuid(this.challenge.id, action.news.id),
+          );
+      }
+      this.timeline = new EventTimeline({
+        challengeId: this.challenge.id,
+        enabled: true,
+        startsAt: this.challenge.startsAt.getTime(),
+        minuteMs: env.minuteMs,
+        actions,
+        loadCompletedActionIds: async () =>
+          (await loadReceipts()).map((row) => row.actionId),
+        execute,
+      });
+      this.setVolatility(1);
+      return;
+    }
+    for (const news of EDEN_EVENT_NEWS)
+      this.scriptedNews.add(eventActionUuid(this.challenge.id, news.id));
+    this.timeline = new EventTimeline({
+      challengeId: this.challenge.id,
+      enabled: true,
+      startsAt: this.challenge.startsAt.getTime(),
+      minuteMs: env.minuteMs,
+      loadCompletedActionIds: async () =>
+        (await loadReceipts()).map((row) => row.actionId),
+      execute,
+    });
+    const state = edenEventStateAt(
+      ((Date.now() - this.challenge.startsAt.getTime()) / env.minuteMs) * 60,
+    );
+    this.setVolatility(state.botVolatilityMultiplier);
+  }
+
+  private setVolatility(multiplier: number): void {
+    this.engine.setVolatilityMultiplier(multiplier);
+    this.edenBots?.setVolatilityMultiplier(multiplier);
+  }
+
+  private createExecutor(): EventExecutor {
+    return new EventExecutor({
+      challenge: this.challenge,
+      db: this.db,
+      redis: this.redis,
+      engine: this.engine,
+      minuteMs: env.minuteMs,
+      emit: (events) => this.emit(events),
+      addSpotSymbol: (cfg, locked, ts) => this.addSpotSymbol(cfg, locked, ts),
+      addEtf: (cfg, ts) => this.addEtf(cfg, ts),
+      addBond: async (template) => {
+        const listed = (await this.ensureMarkets()).listBond(template);
+        // Scheduled (Fresher) bonds are announced by their script.
+        if (listed && !template.schedule)
+          await this.announceBond(template, Date.now());
+      },
+      closeBond: (bondId) => this.markets?.closeBond(bondId),
+      payBondCoupon: async (bondId, index, maturity, ts) => {
+        await (
+          await this.ensureMarkets()
+        ).payScheduledCoupon(bondId, index, maturity, ts);
+      },
+      openOptions: async (config) => {
+        this.eden = this.challenge.config.eden;
+        if (this.eden) this.eden.options = config;
+        await this.ensureOptions();
+      },
+      setFrozen: async (frozen) => {
+        this.frozen = frozen;
+        this.challenge.frozen = frozen;
+        this.engine.setFrozen(frozen);
+        await this.db
+          .update(challenges)
+          .set({ frozen })
+          .where(eq(challenges.id, this.challenge.id));
+        await this.syncMarketStatus();
+        await publishBroadcast(this.redis, this.challenge.id, [
+          {
+            target: "all",
+            msg: {
+              type: "alert",
+              challengeId: this.challenge.id,
+              data: {
+                level: "info",
+                message: frozen
+                  ? "Trading halted. Positions are retained."
+                  : "Trading resumed.",
+                ts: Date.now(),
+              },
+            },
+          },
+        ]);
+      },
+      resolveAuction: (id, ts, until) =>
+        this.settlements.resolveAuction(id, ts, until),
+      resolveVote: (id, ts) => this.settlements.resolveVote(id, ts),
+      awardGrant: (id, ts) => this.settlements.awardGrant(id, ts),
+      rescueLoans: (ts) => this.settlements.rescueLoans(ts),
+      setVolatility: (multiplier) => this.setVolatility(multiplier),
+      prepareVega: async (symbol, releaseAt, now) => {
+        // A later-dated event series avoids the normal cycle expiring before the dump.
+        await (
+          await this.ensureOptions()
+        ).openOn(symbol, releaseAt + env.minuteMs);
+        this.edenBots?.prepareVolEvent(symbol, releaseAt, now, env.minuteMs);
+        await this.botTick();
+      },
+      resolveVega: async (symbol, now) => {
+        this.edenBots?.resolveVolEvent(symbol, now);
+        await this.botTick();
+      },
+      newsPulse: (effects, vol) => this.edenBots?.onNewsPulse(effects, vol),
+      setEtfWindow: async (symbol, open, ts) => {
+        await (await this.ensureMarkets()).setWindow(symbol, open, ts);
+      },
+      finalize: (ts) => this.finalize(ts),
+    });
+  }
+
+  private async advanceClock(now: number): Promise<void> {
+    if (this.finalized) return;
+    if (this.edenEnabled && this.challenge.startsAt) {
+      const start = this.challenge.startsAt.getTime();
+      const end = Math.min(now, this.challenge.endsAt?.getTime() ?? now);
+      const due = Math.max(0, Math.floor((end - start) / env.minuteMs));
+      const timeline = this.scriptManual ? undefined : this.timeline;
+      while (this.minuteCount < due && !this.finalized) {
+        const boundary = start + (this.minuteCount + 1) * env.minuteMs;
+        await timeline?.tick(now, boundary - 0.001);
+        if (this.finalized) break;
+        // Charge the completed minute before the transition at its end.
+        await this.minuteTick(boundary);
+        this.minuteCount++;
+        this.persistence.setProgress({ minuteCount: this.minuteCount });
+        await this.persistence.flush({ minuteCount: this.minuteCount });
+        await timeline?.tick(now, boundary);
+      }
+    }
+    if (!this.scriptManual) await this.timeline?.tick(now);
+    await this.cues?.tick(now);
+    if (this.finalized) return;
+    if (
+      !this.scriptManual &&
+      this.challenge.endsAt &&
+      now >= this.challenge.endsAt.getTime()
+    ) {
+      await this.finalize(this.challenge.endsAt.getTime());
+      return;
+    }
+    if (now - this.recoveryAt >= Math.min(1000, env.minuteMs / 10)) {
+      this.recoveryAt = now;
+      if (this.edenEnabled) await this.settlements.recover(now);
+    }
+  }
+
+  private async syncMarketStatus(): Promise<void> {
+    await setMarketFrozen(this.redis, this.challenge.id, this.frozen);
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: {
+          type: "market_status",
+          challengeId: this.challenge.id,
+          data: { frozen: this.frozen },
+        },
+      },
+    ]);
+  }
+
+  /** Called under the mutation queue, before the challenge leaves active scoring. */
+  private async finalize(ts: number): Promise<void> {
+    if (this.finalized) return;
+    this.frozen = true;
+    this.engine.setFrozen(true);
+    await this.syncMarketStatus();
+    await this.db
+      .update(challenges)
+      .set({ frozen: true })
+      .where(eq(challenges.id, this.challenge.id));
+    this.markets?.stop();
+    await this.options?.expireAll(ts);
+    // Capture mids while resting quotes are still on the book.
+    this.engine.markBooksToMid();
+    const events: EngineEvent[] = [];
+    for (const id of this.engine.accountIds())
+      events.push(...this.engine.cancelUserOrders(id, ts));
+    await this.emit(events);
+    if (this.edenEnabled) await this.settlements.repayLoans(ts, true);
+    await this.persistence.flush({ minuteCount: this.minuteCount });
+    await this.db
+      .update(challenges)
+      .set({ status: "ended" })
+      .where(eq(challenges.id, this.challenge.id));
+    await finalizeScores(this.db, this.redis, this.challenge.id);
+    await this.db
+      .update(challenges)
+      .set({ finalizedAt: new Date(), frozen: true })
+      .where(eq(challenges.id, this.challenge.id));
+    this.finalized = true;
+    this.challenge.status = "ended";
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: {
+          type: "alert",
+          challengeId: this.challenge.id,
+          data: {
+            level: "info",
+            message:
+              "Trading halted. Final settlement and rankings are complete.",
+            ts,
+          },
+        },
+      },
+    ]);
+    // Fresher Sprint: rankings were hidden for the final phase; publish the
+    // final standings as soon as they are settled unless the host holds them.
+    if (isFresherEden(this.eden) && !this.eden?.holdFinalResults) {
+      await this.db
+        .update(challenges)
+        .set({ leaderboardHidden: false })
+        .where(eq(challenges.id, this.challenge.id));
+      this.challenge.leaderboardHidden = false;
+      await publishBroadcast(this.redis, this.challenge.id, [
+        {
+          target: "all",
+          msg: {
+            type: "leaderboard_visibility",
+            challengeId: this.challenge.id,
+            data: { hidden: false },
+          },
+        },
+      ]);
+    }
+  }
+
+  async finish(): Promise<void> {
+    await this.enqueue(() => this.finalize(Date.now()));
+  }
+
+  private async process(cmd: EngineCommand): Promise<EngineEvent[]> {
+    switch (cmd.type) {
+      case "place_order":
+        return this.engine.placeOrder({
+          orderId: cmd.orderId,
+          userId: cmd.userId,
+          symbol: cmd.symbol,
+          side: cmd.side,
+          orderType: cmd.orderType,
+          quantity: cmd.quantity,
+          price: cmd.price,
+          ts: cmd.ts,
+          admin: cmd.admin,
+          ...(cmd.timeInForce === "IOC" ? { timeInForce: "IOC" } : {}),
+        });
+      case "cancel_order":
+        return this.engine.cancelOrder({
+          orderId: cmd.orderId,
+          userId: cmd.userId,
+          symbol: cmd.symbol,
+          side: cmd.side,
+          ts: cmd.ts,
+        });
+      case "set_frozen":
+        this.frozen = cmd.frozen;
+        this.challenge.frozen = cmd.frozen;
+        this.engine.setFrozen(cmd.frozen);
+        return [];
+      case "issue_loan":
+        await this.settlements.issueLoan(cmd.loanId, Date.now());
+        return [];
+      case "resolve_auction":
+        await this.settlements.resolveAuction(cmd.auctionId, Date.now());
+        return [];
+      case "force_liquidate":
+        if (this.frozen) return [];
+        return this.liquidate(cmd.userId, cmd.reason, cmd.ts);
+      case "admin_set_account":
+        return this.setAccount(cmd);
+      case "admin_restore_backup":
+        return this.restoreBackup(cmd);
+      case "set_fair_value": {
+        const fv = this.engine.setFairValue(cmd.symbol, cmd.fairValue);
+        return [
+          {
+            type: "fair_value",
+            challengeId: this.challenge.id,
+            symbol: cmd.symbol,
+            fairValue: fv,
+            ts: cmd.ts,
+          },
+        ];
+      }
+      case "apply_fv_delta":
+        return cmd.effects.map((e) => ({
+          type: "fair_value" as const,
+          challengeId: this.challenge.id,
+          symbol: e.symbol,
+          fairValue: this.engine.applyFairValueDelta(e.symbol, e.delta),
+          ts: cmd.ts,
+        }));
+      case "news_pulse":
+        this.edenBots?.onNewsPulse(cmd.effects, cmd.volEvent);
+        return [];
+      case "exercise_option":
+        if (this.frozen) return [];
+        return (
+          (await this.options?.exercise(
+            cmd.userId,
+            cmd.symbol,
+            cmd.quantity,
+            Date.now(),
+          )) ?? []
+        );
+      case "add_symbol":
+        await this.addSpotSymbol(cmd.config, cmd.locked, cmd.ts);
+        return [];
+      case "add_etf":
+        await this.addEtf(cmd.config, cmd.ts);
+        return [];
+      case "open_option_cycle": {
+        const mgr = await this.ensureOptions();
+        if (cmd.underlying) await mgr.openOn(cmd.underlying);
+        else await mgr.openAll();
+        return [];
+      }
+      case "close_option_cycle":
+        await this.options?.close(cmd.cycleId);
+        return [];
+      case "purchase_bond":
+        if (this.frozen) return [];
+        await this.markets?.purchaseBond(
+          cmd.userId,
+          cmd.bondId,
+          cmd.price,
+          cmd.ts,
+        );
+        return [];
+      case "etf_trade":
+        if (this.frozen) return [];
+        await this.markets?.etfTrade(
+          cmd.userId,
+          cmd.etfSymbol,
+          cmd.action,
+          cmd.quantity,
+          cmd.ts,
+        );
+        return [];
+      case "etf_window":
+        await this.markets?.setWindow(cmd.etfSymbol, cmd.open, cmd.ts);
+        return [];
+      case "execute_otc":
+        await this.settlements.settleOtc(cmd.offerId, Date.now());
+        return [];
+      case "apply_wealth_tax":
+        if (cmd.proposalId)
+          await this.settlements.applyTax(cmd.proposalId, Date.now(), {
+            ratePct: cmd.ratePct,
+            topPct: cmd.topPct,
+            bottomPct: cmd.bottomPct,
+          });
+        return [];
+      case "award_grant":
+        await this.settlements.awardGrant(cmd.grantId, Date.now());
+        return [];
+      case "run_cue": {
+        const now = Date.now();
+        if (!(await this.cues?.fire(cmd.cueId, now))) {
+          console.warn(
+            `[${this.challenge.slug}] ignored cue ${cmd.cueId}: unknown, already run, or blocked`,
+          );
+          return [];
+        }
+        await this.pinCueSheetEnd();
+        await this.cues?.tick(now);
+        return [];
+      }
+      case "set_bots":
+        return this.applyBotConfig(cmd.bots, cmd.edenBots, cmd.ts);
+      case "script_mode":
+        await this.setScriptManual(cmd.manual);
+        return [];
+      case "run_script_cue":
+        await this.runScriptCue(cmd.cueId, Date.now());
+        return [];
+      default:
+        return [];
+    }
+  }
+
+  /**
+   * Resume the command stream without dropping the go-live backlog or
+   * replaying a live challenge's history after a deploy.
+   *
+   * - Stored cursor: always win (normal restart).
+   * - No cursor + no event stream: first runner for this challenge — read
+   *   from the beginning so place_order / issue_loan in the reconcile window
+   *   are not skipped (`$` would drop them).
+   * - No cursor + existing events: a prior runner already processed the
+   *   stream. Start at the tip so we do not re-apply fills against empty books.
+   */
+  private async loadCommandCursor(): Promise<string> {
+    const stored = await this.redis.get(
+      redisKeys.commandCursor(this.challenge.id),
+    );
+    if (stored && stored.length > 0) return stored;
+    const priorEvents = await this.redis.xlen(
+      redisKeys.eventStream(this.challenge.id),
+    );
+    return priorEvents > 0 ? "$" : "0-0";
+  }
+
+  /**
+   * Publish scheduled news whose publish time has arrived. Atomically claims
+   * due rows by stamping `publishedAt`, then caches + broadcasts each item and
+   * applies its signal/momentum side effects (derived from stored fvEffects).
+   */
+  private async publishDueNews(): Promise<void> {
+    const now = new Date();
+    if (this.finalized) return;
+    const due = await this.db
+      .select()
+      .from(challengeNews)
+      .where(
+        and(
+          eq(challengeNews.challengeId, this.challenge.id),
+          or(
+            isNull(challengeNews.publishAt),
+            lte(challengeNews.publishAt, now),
+          ),
+          or(
+            isNull(challengeNews.publishedAt),
+            isNull(challengeNews.effectsAppliedAt),
+          ),
+        ),
+      )
+      .orderBy(asc(challengeNews.publishAt), asc(challengeNews.createdAt));
+    for (const row of due) {
+      if (this.scriptedNews.has(row.id)) continue;
+      const item: NewsItem = {
+        id: row.id,
+        challengeId: row.challengeId,
+        message: row.message,
+        level: row.level,
+        feed: row.feed,
+        createdAt: row.createdAt.toISOString(),
+        embargoUntil: row.embargoUntil ? row.embargoUntil.toISOString() : null,
+      };
+      if (!row.publishedAt) {
+        await pushNews(this.redis, this.challenge.id, item);
+        await publishBroadcast(this.redis, this.challenge.id, [
+          {
+            target: "all",
+            msg: { type: "news", challengeId: this.challenge.id, data: item },
+          },
+        ]);
+        await this.db
+          .update(challengeNews)
+          .set({ publishedAt: now })
+          .where(eq(challengeNews.id, row.id));
+      }
+      if (row.effectsAppliedAt || (row.embargoUntil && row.embargoUntil > now))
+        continue;
+      const fvEvents: EngineEvent[] = [];
+      const effects = row.fvEffects ?? [];
+      if (row.kind === "signal" && effects.length > 0) {
+        for (const e of effects) {
+          fvEvents.push({
+            type: "fair_value",
+            challengeId: this.challenge.id,
+            symbol: e.symbol,
+            fairValue: this.engine.applyFairValueDelta(e.symbol, e.delta),
+            ts: now.getTime(),
+          });
+        }
+      }
+      const momentum =
+        row.momentum ??
+        effects
+          .filter((e) => e.delta !== 0)
+          .map((e) => ({ symbol: e.symbol, sentiment: Math.sign(e.delta) }));
+      if (momentum.length > 0) {
+        this.edenBots?.onNewsPulse(momentum, row.volEvent);
+      }
+      this.persistence.queueWrite(async (tx) => {
+        await tx
+          .update(challengeNews)
+          .set({ effectsAppliedAt: now })
+          .where(eq(challengeNews.id, row.id));
+      });
+      await this.emit(fvEvents);
+      await this.persistence.flush();
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Live instrument introduction (any challenge type, no pause)
+   * ------------------------------------------------------------------ */
+
+  /** Lazily construct the options manager so any challenge type can list them. */
+  private async ensureOptions(autoCycle?: boolean): Promise<OptionsManager> {
+    if (!this.options) {
+      const opts = zEdenOptionsConfig.parse({
+        ...this.challenge.config.eden?.options,
+        enabled: true,
+        autoCycle:
+          autoCycle ?? this.challenge.config.eden?.options?.autoCycle ?? false,
+      });
+      const rules = this.eden?.rules ?? zEdenRules.parse({});
+      this.options = new OptionsManager(
+        this.engine,
+        this.redis,
+        this.db,
+        this.challenge,
+        opts,
+        rules,
+        env.minuteMs,
+        (events) => this.emit(events),
+        (userIds, ts) => this.refreshPortfolios(userIds, ts),
+      );
+      this.options.setDispatcher(this.dispatch);
+      this.options.setPersistence(this.persistence);
+      await this.options.start();
+    }
+    return this.options;
+  }
+
+  /** Lazily construct the markets manager so any challenge type can list ETFs. */
+  private async ensureMarkets(): Promise<MarketsManager> {
+    if (!this.markets) {
+      this.markets = new MarketsManager(
+        this.engine,
+        this.redis,
+        this.db,
+        this.challenge,
+        [],
+        [],
+        env.minuteMs,
+        (events) => this.emit(events),
+        (userIds, ts) => this.refreshPortfolios(userIds, ts),
+      );
+      this.markets.setDispatcher(this.dispatch);
+      this.markets.setPersistence(this.persistence);
+      await this.markets.start();
+    }
+    return this.markets;
+  }
+
+  /** Introduce a spot asset into the live book and announce it to clients. */
+  private async addSpotSymbol(
+    cfg: SymbolConfig,
+    locked: boolean,
+    ts: number,
+  ): Promise<void> {
+    // Skip if the symbol already has a book (idempotent on redelivery).
+    if (this.engine.getPrice(cfg.symbol) !== undefined) return;
+    this.engine.addSymbol(cfg, { autonomous: true });
+    this.bots.addSymbol(cfg);
+    this.edenBots?.addSymbol(cfg);
+    await setPrice(
+      this.redis,
+      this.challenge.id,
+      cfg.symbol,
+      cfg.initialPrice,
+      ts,
+    );
+    await setBookSnapshot(this.redis, this.challenge.id, {
+      symbol: cfg.symbol,
+      bids: [],
+      asks: [],
+      sequence: 0,
+    });
+    if (this.edenEnabled) {
+      const fv = this.engine.setFairValue(cfg.symbol, cfg.initialPrice);
+      await setFairValue(this.redis, this.challenge.id, cfg.symbol, fv);
+    }
+    await addListedSymbol(this.redis, this.challenge.id, cfg.symbol);
+    if (locked) {
+      await setSymbolTradeable(
+        this.redis,
+        this.challenge.id,
+        cfg.symbol,
+        false,
+      );
+    }
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: {
+          type: "symbol_listed",
+          challengeId: this.challenge.id,
+          data: { config: cfg, kind: "spot", locked, ts },
+        },
+      },
+    ]);
+  }
+
+  /** Swap live bot counts without tearing down the runner. */
+  private async applyBotConfig(
+    bots: BotConfig | undefined,
+    edenBots: EdenBotConfig | undefined,
+    ts: number,
+  ): Promise<EngineEvent[]> {
+    const events: EngineEvent[] = [];
+    const next: ChallengeConfig = { ...this.challenge.config };
+    if (bots) {
+      next.bots = bots;
+      this.bots.setConfig(bots);
+    }
+    if (edenBots) {
+      const eden = zEdenConfig.parse({
+        ...this.challenge.config.eden,
+        bots: edenBots,
+      });
+      next.eden = eden;
+      this.eden = { ...this.eden, ...eden };
+      if (this.edenEnabled) {
+        if (!this.edenBots) {
+          this.edenBots = new EdenBotEngine(
+            this.engine,
+            edenBots,
+            this.challenge.config.symbols,
+          );
+        } else {
+          for (const c of this.edenBots.setConfig(edenBots, ts)) {
+            events.push(...this.engine.cancelOrder(c));
+          }
+        }
+      }
+    }
+    this.challenge.config = next;
+    await this.db
+      .update(challenges)
+      .set({ config: next })
+      .where(eq(challenges.id, this.challenge.id));
+    return events;
+  }
+
+  /** Introduce an ETF into the live challenge and announce it to clients. */
+  private async addEtf(cfg: EtfConfig, ts: number): Promise<void> {
+    const mgr = await this.ensureMarkets();
+    const listed = await mgr.listEtf(cfg);
+    const etfs = this.challenge.config.eden?.etfs ?? [];
+    this.edenBots?.setEtfs(
+      etfs.some((e) => e.symbol === cfg.symbol) ? etfs : [...etfs, cfg],
+    );
+    if (!listed) return;
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: {
+          type: "symbol_listed",
+          challengeId: this.challenge.id,
+          data: { config: listed, kind: "etf", locked: false, ts },
+        },
+      },
+    ]);
+  }
+
+  /** Tell every trader a government bond series is now for sale. */
+  private async announceBond(
+    template: BondTemplate,
+    ts: number,
+  ): Promise<void> {
+    const multiplier = template.payoutMultiplier ?? 2;
+    const message = `${template.name} is listed. Choose a principal up to your free cash; ${multiplier}× is paid through the close.`;
+    const item: NewsItem = {
+      id: eventActionUuid(this.challenge.id, `bond-listed/${template.id}`),
+      challengeId: this.challenge.id,
+      message,
+      level: "info",
+      feed: "announcement",
+      createdAt: new Date(ts).toISOString(),
+    };
+    await this.db
+      .insert(challengeNews)
+      .values({
+        id: item.id,
+        challengeId: this.challenge.id,
+        message,
+        level: "info",
+        feed: "announcement",
+        kind: "neutral",
+        publishedAt: new Date(ts),
+        createdAt: new Date(ts),
+      })
+      .onConflictDoNothing();
+    await pushNews(this.redis, this.challenge.id, item);
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: { type: "news", challengeId: this.challenge.id, data: item },
+      },
+      {
+        target: "all",
+        msg: {
+          type: "alert",
+          challengeId: this.challenge.id,
+          data: { level: "info", message, ts },
+        },
+      },
+    ]);
+  }
+
+  /** Apply a host account override, persist it, and tell the trader. */
+  private async setAccount(
+    cmd: Extract<EngineCommand, { type: "admin_set_account" }>,
+  ): Promise<EngineEvent[]> {
+    try {
+      this.engine.setAccount(cmd.userId, {
+        cash: cmd.cash,
+        cashDelta: cmd.cashDelta,
+        positions: cmd.positions,
+      });
+    } catch (err) {
+      console.warn(
+        `[${this.challenge.slug}] rejected account edit for ${cmd.userId}`,
+        err,
+      );
+      return [];
+    }
+    const signed = (n: string) => (n.startsWith("-") ? n : `+${n}`);
+    const changes = [
+      ...(cmd.cash !== undefined ? [`cash ${cmd.cash.toFixed(2)}`] : []),
+      ...(cmd.cashDelta !== undefined
+        ? [`cash ${signed(cmd.cashDelta.toFixed(2))}`]
+        : []),
+      ...(cmd.positions ?? []).map((p) =>
+        p.delta !== undefined
+          ? `${p.symbol} ${signed(String(p.delta))}`
+          : `${p.symbol} ${p.quantity}`,
+      ),
+    ];
+    await this.refreshPortfolios([cmd.userId], cmd.ts);
+    return [
+      {
+        type: "alert",
+        challengeId: this.challenge.id,
+        userId: cmd.userId,
+        level: "warning",
+        message: `The host adjusted your account: ${changes.join(", ")}.`,
+        ts: cmd.ts,
+      },
+    ];
+  }
+
+  /**
+   * Replace cash, inventory, loan debt, and bonds from a host CSV backup.
+   * Working orders are cancelled first so restored inventory is not then filled.
+   */
+  private async restoreBackup(
+    cmd: Extract<EngineCommand, { type: "admin_restore_backup" }>,
+  ): Promise<EngineEvent[]> {
+    const events: EngineEvent[] = [];
+    const metricsByUser = new Map(
+      this.engine.exportState().accounts.map((a) => [a.userId, a.metrics]),
+    );
+    for (const row of cmd.accounts) {
+      events.push(...this.engine.cancelUserOrders(row.userId, cmd.ts));
+    }
+    this.persistence.collect(events);
+    for (const row of cmd.accounts) {
+      // Restore listed symbols, and also keep a held symbol even if delisted.
+      const allowed = row.positions.filter(
+        (p) =>
+          this.engine.hasSymbol(p.symbol) ||
+          this.engine
+            .portfolioOf(row.userId)
+            .positions.some((held) => held.symbol === p.symbol),
+      );
+      this.engine.restoreAccount(row.userId, {
+        cash: row.cash,
+        loanDebt: row.loanDebt,
+        positions: allowed,
+        metrics: metricsByUser.get(row.userId),
+      });
+      this.markets?.replaceUserBonds?.(row.userId, row.bonds);
+    }
+    await this.syncLoanRemaining(cmd.accounts);
+    await this.markets?.persistUserBonds?.(cmd.accounts.map((a) => a.userId));
+    await this.refreshPortfolios(
+      cmd.accounts.map((a) => a.userId),
+      cmd.ts,
+    );
+    await publishBroadcast(this.redis, this.challenge.id, [
+      {
+        target: "all",
+        msg: {
+          type: "alert",
+          challengeId: this.challenge.id,
+          data: {
+            level: "warning",
+            message: `The host restored ${cmd.accounts.length} trader account${cmd.accounts.length === 1 ? "" : "s"} from a CSV backup.`,
+            ts: cmd.ts,
+          },
+        },
+      },
+    ]);
+    return events;
+  }
+
+  /** Keep amortized loan rows aligned with restored engine debt. */
+  private async syncLoanRemaining(
+    accounts: Extract<
+      EngineCommand,
+      { type: "admin_restore_backup" }
+    >["accounts"],
+  ): Promise<void> {
+    const ids = accounts.map((a) => a.userId);
+    if (ids.length === 0) return;
+    const active = await this.db
+      .select()
+      .from(loans)
+      .where(
+        and(
+          eq(loans.challengeId, this.challenge.id),
+          inArray(loans.userId, ids),
+          eq(loans.status, "active"),
+        ),
+      );
+    const byUser = new Map<string, (typeof active)[number][]>();
+    for (const loan of active) {
+      const rows = byUser.get(loan.userId) ?? [];
+      rows.push(loan);
+      byUser.set(loan.userId, rows);
+    }
+    this.persistence.queueWrite(async (tx) => {
+      for (const row of accounts) {
+        const loansForUser = byUser.get(row.userId) ?? [];
+        if (row.loanDebt <= 0) {
+          for (const loan of loansForUser) {
+            await tx
+              .update(loans)
+              .set({ remaining: 0, status: "repaid", nextPaymentAt: null })
+              .where(eq(loans.id, loan.id));
+          }
+          continue;
+        }
+        const first = loansForUser[0];
+        if (!first) continue;
+        const rest = loansForUser.slice(1);
+        await tx
+          .update(loans)
+          .set({ remaining: row.loanDebt, status: "active" })
+          .where(eq(loans.id, first.id));
+        for (const loan of rest) {
+          await tx
+            .update(loans)
+            .set({ remaining: 0, status: "repaid", nextPaymentAt: null })
+            .where(eq(loans.id, loan.id));
+        }
+      }
+    });
+  }
+
+  /** Flatten a trader's positions at market and emit a margin-call notice. */
+  private liquidate(
+    userId: string,
+    _reason: string,
+    ts: number,
+    notify = true,
+  ): EngineEvent[] {
+    const freeBefore = this.engine.freeCashOf(userId);
+    const events = this.engine.cancelUserOrders(userId, ts);
+    const cmds = this.engine.liquidationCommands(userId, ts);
+    for (const c of cmds) events.push(...this.engine.placeOrder(c));
+    if (!notify) return events;
+    const liquidated = this.engine.absInventoryOf(userId) === 0;
+    events.push({
+      type: "margin_call",
+      challengeId: this.challenge.id,
+      userId,
+      freeCash: freeBefore,
+      liquidated,
+      ts,
+    });
+    return events;
+  }
+
+  /** Drive autonomous bots: apply their commands and broadcast results. */
+  private async botTick(): Promise<void> {
+    if (!this.running || this.frozen) return;
+    const now = Date.now();
+    const action: ReturnType<EdenBotEngine["act"]> = this.edenBots
+      ? this.edenBots.act(now)
+      : this.bots.act(now);
+    const { places, cancels } = action;
+    const events: EngineEvent[] = [];
+    for (const c of cancels) {
+      events.push(...this.engine.cancelOrder(c));
+    }
+    for (const p of places) {
+      events.push(...this.engine.placeOrder(p));
+      events.push(...this.enforceMargins(now));
+    }
+    if ("batches" in action) {
+      for (const batch of action.batches ?? []) {
+        events.push(...this.engine.placeAtomicOrders(batch));
+        events.push(...this.enforceMargins(now));
+      }
+    }
+    await this.emit(events);
+  }
+
+  private async tick(): Promise<void> {
+    if (!this.running || this.frozen) return;
+    const now = Date.now();
+    const events: EngineEvent[] = [];
+    // Sample two-sided quoting for market-making uptime scoring.
+    if (this.challenge.scoring.kind === "market_making") {
+      this.engine.sampleQuoteUptime(
+        env.tickMs,
+        this.challenge.scoring.maxSpread,
+        this.challenge.scoring.minQuoteSize,
+      );
+    }
+    const commonShock = Math.random();
+    // AERIUM and NEURO move together until the minute-90 dis-correlation shock.
+    const correlated = this.cues
+      ? !this.cues.completed(
+          `${EDEN_EVENT_VERSION}/news/${EDEN_EVENT_SHOCK_MINUTE}/public`,
+        )
+      : this.eden?.eventScript &&
+        this.challenge.startsAt &&
+        now <
+          this.challenge.startsAt.getTime() +
+            EDEN_EVENT_SHOCK_MINUTE * env.minuteMs;
+    for (const symbol of this.engine.autonomousSymbols()) {
+      const driftKey = `qtp:drift_target:${this.challenge.id}:${symbol}`;
+      const target = await this.redis.get(driftKey);
+      if (target != null) {
+        const speed = Number(
+          (await this.redis.get(
+            `qtp:drift_speed:${this.challenge.id}:${symbol}`,
+          )) ?? 5,
+        );
+        const { event, reached } = this.engine.driftTick(
+          symbol,
+          now,
+          Number(target),
+          speed,
+        );
+        if (event) events.push(event);
+        if (reached) {
+          await this.redis.del(driftKey);
+          await this.redis.del(
+            `qtp:drift_speed:${this.challenge.id}:${symbol}`,
+          );
+        }
+      } else {
+        const rng =
+          correlated && (symbol === "AERIUM" || symbol === "NEURO")
+            ? () => 0.8 * commonShock + 0.2 * Math.random()
+            : Math.random;
+        const ev = this.engine.tickPrice(symbol, now, rng);
+        if (ev) events.push(ev);
+      }
+    }
+    await this.emit(events);
+    // Re-mark ETF NAVs against the fresh basket prices.
+    await this.markets?.updateNavs(now);
+  }
+
+  /**
+   * New Eden game-minute accrual: cost of carry, bond payouts, predatory loan
+   * bleed, and margin-call enforcement with forced liquidation.
+   */
+  private async minuteTick(now: number): Promise<void> {
+    if (!this.edenEnabled || !this.eden) return;
+    const rules = this.eden.rules;
+    const minute = this.minuteCount + 1;
+    // Each substep has its own receipt because managers commit at settlement boundaries.
+    const step = async (kind: string, apply: () => Promise<void>) => {
+      const actionId = `minute:${minute}:${kind}`;
+      const [done] = await this.db
+        .select()
+        .from(eventActions)
+        .where(
+          and(
+            eq(eventActions.challengeId, this.challenge.id),
+            eq(eventActions.actionId, actionId),
+          ),
+        );
+      if (done) return;
+      this.persistence.queueWrite(async (tx) => {
+        await tx
+          .insert(eventActions)
+          .values({ challengeId: this.challenge.id, actionId })
+          .onConflictDoNothing();
+      });
+      await apply();
+      await this.persistence.flush();
+    };
+    await step("carry", async () => {
+      const events: EngineEvent[] = [];
+      for (const userId of this.engine.accountIds()) {
+        if (!UUID_RE.test(userId)) continue;
+        const amount = this.engine.applyCarry(
+          userId,
+          rules.costOfCarryPerUnitPerMinute,
+        );
+        if (amount > 0)
+          events.push({
+            type: "carry_charge",
+            challengeId: this.challenge.id,
+            userId,
+            amount,
+            ts: now,
+          });
+      }
+      await this.emit(events);
+    });
+    // Halftime / host freeze is not a payment period for bonds or loans.
+    if (this.frozen) {
+      await this.settlements.repayLoans(now);
+      return;
+    }
+    if (this.markets) {
+      await step("coupons", () => this.markets!.payCoupons(now));
+    }
+    await this.settlements.repayLoans(now);
+  }
+
+  private applyBuyCashFloor(): void {
+    this.engine.setBuyCashFloor(
+      this.edenEnabled ? this.eden?.rules.marginCallThreshold : undefined,
+    );
+  }
+
+  private enforceMargins(now: number): EngineEvent[] {
+    if (!this.edenEnabled || !this.eden) return [];
+    const events: EngineEvent[] = [];
+    const threshold = this.eden.rules.marginCallThreshold;
+    // Revisit counterparties once after liquidation trades; bound work if liquidity is absent.
+    for (let pass = 0; pass < 2; pass++) {
+      for (const id of this.engine.accountIds()) {
+        if (!UUID_RE.test(id)) continue;
+        const free = this.engine.freeCashOf(id);
+        if (free > threshold) {
+          this.marginNotices.delete(id);
+          this.marginFlattenNotified.delete(id);
+          continue;
+        }
+        const cancelledBuys = this.engine.cancelUserOrders(id, now, "buy");
+        events.push(...cancelledBuys);
+        const noticedAt = this.marginNotices.get(id);
+        const first = noticedAt === undefined;
+        if (first) {
+          this.marginNotices.set(id, now);
+          if (cancelledBuys.some((e) => e.type === "order_update")) {
+            events.push({
+              type: "alert",
+              challengeId: this.challenge.id,
+              userId: id,
+              level: "warning",
+              message:
+                "Cash below limit — working buys cancelled. Sells only until cash is restored.",
+              ts: now,
+            });
+          }
+          events.push({
+            type: "margin_call",
+            challengeId: this.challenge.id,
+            userId: id,
+            freeCash: free,
+            liquidated: false,
+            ts: now,
+          });
+          continue;
+        }
+        const canFlatten =
+          !this.frozen &&
+          this.eden.rules.forcedLiquidation &&
+          this.engine.absInventoryOf(id) > 0 &&
+          now - noticedAt >= MARGIN_BORROW_GRACE_MS;
+        if (canFlatten) {
+          const notify = !this.marginFlattenNotified.has(id);
+          if (notify) this.marginFlattenNotified.add(id);
+          events.push(...this.liquidate(id, "cash exhausted", now, notify));
+        }
+      }
+    }
+    return events;
+  }
+
+  private async emit(events: EngineEvent[]): Promise<void> {
+    const tEmit = performance.now();
+    events.push(...this.enforceMargins(Date.now()));
+    if (events.length === 0) return;
+    this.persistence.collect(events);
+    const now = Date.now();
+    const envelopes: BroadcastEnvelope[] = [];
+    const affectedUsers = new Set<string>();
+    // Bot cancel-replace emits a book_update per cancel and per place. Only
+    // the last snapshot per symbol is hot-cached and broadcast so clients do
+    // not paint the empty intermediate book.
+    const lastPrice = new Map<
+      string,
+      Extract<EngineEvent, { type: "price_update" }>
+    >();
+    const lastBook = new Map<
+      string,
+      Extract<EngineEvent, { type: "book_update" }>
+    >();
+    const lastTrade = new Set<string>();
+
+    for (const e of events) {
+      switch (e.type) {
+        case "price_update":
+          if (!lastTrade.has(e.symbol)) lastPrice.set(e.symbol, e);
+          break;
+        case "book_update":
+          lastBook.set(e.symbol, e);
+          break;
+        case "trade":
+          lastTrade.add(e.symbol);
+          lastPrice.set(e.symbol, {
+            type: "price_update",
+            challengeId: this.challenge.id,
+            symbol: e.symbol,
+            price: e.price,
+            change: 0,
+            ts: e.ts,
+          });
+          affectedUsers.add(e.buyerId);
+          affectedUsers.add(e.sellerId);
+          envelopes.push({
+            target: "all",
+            msg: {
+              type: "trade",
+              challengeId: this.challenge.id,
+              data: {
+                symbol: e.symbol,
+                price: e.price,
+                quantity: e.quantity,
+                takerSide: e.takerSide,
+                ts: e.ts,
+              },
+            },
+          });
+          break;
+        case "order_update":
+          affectedUsers.add(e.userId);
+          envelopes.push({
+            target: e.userId,
+            msg: {
+              type: "order",
+              challengeId: this.challenge.id,
+              data: {
+                orderId: e.orderId,
+                symbol: e.symbol,
+                side: e.side,
+                status: e.status,
+                remainingQuantity: e.remainingQuantity,
+                ts: e.ts,
+                ...(e.reason ? { reason: e.reason } : {}),
+              },
+            },
+          });
+          break;
+        case "carry_charge":
+        case "loan_update":
+        case "option_exercised":
+        case "option_assigned":
+        case "otc_settled":
+          // Cash/positions changed — refresh the trader's portfolio.
+          affectedUsers.add(e.userId);
+          break;
+        case "grant_awarded":
+          if (e.userId) affectedUsers.add(e.userId);
+          break;
+        case "wealth_tax":
+          // Redistribution touched many accounts; the alerts that accompany it
+          // carry per-user portfolio refreshes via their own affectedUsers set.
+          break;
+        case "margin_call":
+          affectedUsers.add(e.userId);
+          envelopes.push({
+            target: e.userId,
+            msg: {
+              type: "margin_call",
+              challengeId: this.challenge.id,
+              data: {
+                freeCash: e.freeCash,
+                liquidated: e.liquidated,
+                ts: e.ts,
+              },
+            },
+          });
+          break;
+        case "alert":
+          envelopes.push({
+            target: e.userId,
+            msg: {
+              type: "alert",
+              challengeId: this.challenge.id,
+              data: { level: e.level, message: e.message, ts: e.ts },
+            },
+          });
+          break;
+        case "fair_value":
+          await setFairValue(
+            this.redis,
+            this.challenge.id,
+            e.symbol,
+            e.fairValue,
+          );
+          this.persistence.queueWrite(async (tx) => {
+            await tx
+              .insert(fairValues)
+              .values({
+                challengeId: this.challenge.id,
+                symbol: e.symbol,
+                fairValue: e.fairValue,
+                updatedAt: new Date(e.ts),
+              })
+              .onConflictDoUpdate({
+                target: [fairValues.challengeId, fairValues.symbol],
+                set: { fairValue: e.fairValue, updatedAt: new Date(e.ts) },
+              });
+          });
+          envelopes.push({
+            target: "all",
+            msg: {
+              type: "fair_value",
+              challengeId: this.challenge.id,
+              data: { symbol: e.symbol, fairValue: e.fairValue, ts: e.ts },
+            },
+          });
+          break;
+      }
+    }
+
+    for (const e of lastPrice.values()) {
+      await setPrice(this.redis, this.challenge.id, e.symbol, e.price, now);
+      {
+        const snap = this.engine.snapshot(e.symbol);
+        const mid = midFromBook(snap.bids, snap.asks) ?? e.price;
+        await setMidPrice(this.redis, this.challenge.id, e.symbol, mid, now);
+      }
+      envelopes.push({
+        target: "all",
+        msg: {
+          type: "price",
+          challengeId: this.challenge.id,
+          data: {
+            symbol: e.symbol,
+            price: e.price,
+            change: e.change,
+            timestamp: e.ts,
+          },
+        },
+      });
+    }
+    for (const e of lastBook.values()) {
+      await setBookSnapshot(this.redis, this.challenge.id, {
+        symbol: e.symbol,
+        bids: e.bids,
+        asks: e.asks,
+        sequence: e.sequence,
+      });
+      {
+        const mid = midFromBook(e.bids, e.asks);
+        if (mid != null) {
+          await setMidPrice(this.redis, this.challenge.id, e.symbol, mid, now);
+        }
+      }
+      envelopes.push({
+        target: "all",
+        msg: {
+          type: "book",
+          challengeId: this.challenge.id,
+          data: {
+            symbol: e.symbol,
+            bids: e.bids,
+            asks: e.asks,
+            sequence: e.sequence,
+          },
+        },
+      });
+    }
+
+    // Push fresh portfolio snapshots to affected users.
+    for (const userId of affectedUsers) {
+      envelopes.push({
+        target: userId,
+        msg: {
+          type: "portfolio",
+          challengeId: this.challenge.id,
+          data: this.portfolio(userId),
+        },
+      });
+    }
+
+    const tFlush = performance.now();
+    await this.persistence.flush({ minuteCount: this.minuteCount });
+    const tPub = performance.now();
+    await appendEvents(this.redis, this.challenge.id, events);
+    await publishBroadcast(this.redis, this.challenge.id, envelopes);
+    if (env.profile) {
+      const end = performance.now();
+      this.profile("emit.build+redis", tFlush - tEmit);
+      this.profile("emit.flush", tPub - tFlush);
+      this.profile("emit.publish", end - tPub);
+    }
+  }
+
+  /** Re-sync + push fresh portfolios for users touched by off-book settlement. */
+  private async refreshPortfolios(
+    userIds: string[],
+    _ts: number,
+  ): Promise<void> {
+    if (userIds.length === 0) return;
+    this.persistence.markUsers(userIds);
+    const marginEvents = this.enforceMargins(Date.now());
+    if (marginEvents.length) await this.emit(marginEvents);
+    await this.persistence.flush({ minuteCount: this.minuteCount });
+    const envelopes: BroadcastEnvelope[] = userIds.map((userId) => ({
+      target: userId,
+      msg: {
+        type: "portfolio",
+        challengeId: this.challenge.id,
+        data: this.portfolio(userId),
+      },
+    }));
+    await publishBroadcast(this.redis, this.challenge.id, envelopes);
+  }
+
+  private portfolio(userId: string) {
+    const pf = this.engine.portfolioOf(userId);
+    const m = this.engine.metricsOf(userId);
+    // Bond principal is an illiquid mark: it lifts net worth (PnL) but not
+    // free cash, so locking cash into bonds still shrinks margin headroom.
+    const bondValue = this.markets?.bondValueOf(userId) ?? 0;
+    const bonds = this.edenEnabled
+      ? (this.markets?.bondsOf?.(userId) ?? [])
+      : undefined;
+    const marketValue = pf.marketValue + bondValue;
+    const pnl = pf.pnl + bondValue;
+    const score = computeScore(
+      {
+        userId,
+        pnl,
+        absInventory: m.inventory,
+        spreadCapture: m.spreadCapture,
+        quoteUptime: m.quoteUptime,
+      },
+      this.challenge.scoring,
+    );
+    const metrics: TraderMetrics = {
+      realizedPnl: m.realizedPnl,
+      volume: m.volume,
+      trades: m.trades,
+      spreadCapture: m.spreadCapture,
+      quoteUptime: m.quoteUptime,
+      inventory: m.inventory,
+    };
+    return {
+      challengeId: this.challenge.id,
+      cash: pf.cash,
+      positions: pf.positions,
+      marketValue,
+      pnl,
+      score,
+      metrics,
+      ...(this.edenEnabled
+        ? { loanDebt: pf.loanDebt, freeCash: pf.freeCash, bonds }
+        : {}),
+    };
+  }
+
+  /** Persist per-trader metrics to Redis for the scoring worker + analytics. */
+  private async publishMetrics(): Promise<void> {
+    if (!this.running) return;
+    const entries: Array<{ userId: string; metrics: TraderMetrics }> = [];
+    for (const userId of this.engine.accountIds()) {
+      if (!UUID_RE.test(userId)) continue; // skip bots / synthetic ids
+      const m = this.engine.metricsOf(userId);
+      entries.push({
+        userId,
+        metrics: {
+          realizedPnl: m.realizedPnl,
+          volume: m.volume,
+          trades: m.trades,
+          spreadCapture: m.spreadCapture,
+          quoteUptime: m.quoteUptime,
+          inventory: m.inventory,
+        },
+      });
+    }
+    await setTraderMetrics(this.redis, this.challenge.id, entries);
+  }
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}

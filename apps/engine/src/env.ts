@@ -1,0 +1,23 @@
+import { randomUUID } from "node:crypto";
+
+export const env = {
+  redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
+  databaseUrl:
+    process.env.DATABASE_URL ?? "postgresql://qtp:qtp@localhost:5432/qtp",
+  /** Autonomous price tick interval (ms). */
+  tickMs: Number(process.env.ENGINE_TICK_MS ?? 1000),
+  /** Unique identity for leader election. */
+  instanceId: process.env.HOSTNAME ?? `engine-${randomUUID().slice(0, 8)}`,
+  /** Persistence flush interval (ms). */
+  flushMs: Number(process.env.ENGINE_FLUSH_MS ?? 250),
+  /** Bot action interval (ms). */
+  botMs: Number(process.env.ENGINE_BOT_MS ?? 1200),
+  /** Trader-metrics publish interval (ms). */
+  metricsMs: Number(process.env.ENGINE_METRICS_MS ?? 1000),
+  /** New Eden game-minute interval (ms) for carry/loan/margin accrual. */
+  minuteMs: Number(process.env.ENGINE_MINUTE_MS ?? 60_000),
+  /** Rewind checkpoint cadence (wall ms, not scaled by ENGINE_MINUTE_MS). */
+  checkpointMs: Number(process.env.ENGINE_CHECKPOINT_MS ?? 120_000),
+  /** Log mutation-queue time per task kind every 10 s. */
+  profile: process.env.ENGINE_PROFILE === "1",
+};
