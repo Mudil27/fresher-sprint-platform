@@ -19,7 +19,7 @@ interface SsoProfile {
 /** Looser than password login: a whole hall can share one campus IP. */
 const ssoLimit = rateLimit({
   bucket: "sso-callback",
-  limit: 300,
+  limit: 3000,
   windowMs: 60_000,
   by: "ip",
 });
